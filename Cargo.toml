@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.7", features = ["http1", "http2", "macros", "json"] }
+axum-core = "0.4"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.27"
@@ -22,3 +23,5 @@ tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 hyper = { version = "1", features = ["full"] }
+bytes = "1"
+http-body-util = "0.1"

@@ -366,9 +366,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "axum-core",
+ "bytes",
  "chrono",
  "clap",
  "crossterm",
+ "http-body-util",
  "hyper",
  "ratatui",
  "reqwest",
