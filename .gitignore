@@ -4,8 +4,9 @@
 # Local tooling and databases
 /.beads/
 /usage.db
+/usage.db-wal
+/usage.db-shm
 
 # Misc editor / OS files
 .DS_Store
 .env
-
