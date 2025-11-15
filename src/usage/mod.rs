@@ -89,6 +89,16 @@ impl UsageAggregator {
     async fn handle_event(&mut self, event: UsageEvent) -> Result<()> {
         let date = event.timestamp.date_naive();
         self.storage
+            .record_event(
+                event.timestamp,
+                event.prompt_tokens,
+                event.cached_prompt_tokens,
+                event.completion_tokens,
+                event.total_tokens,
+                event.cost_usd,
+            )
+            .await?;
+        self.storage
             .record_daily_stat(
                 date,
                 &event.model,
@@ -213,5 +223,11 @@ mod tests {
         assert_eq!(totals.completion_tokens, event.completion_tokens);
         assert_eq!(totals.total_tokens, event.total_tokens);
         assert!((totals.cost_usd - event.cost_usd).abs() < f64::EPSILON);
+
+        let recent_totals = storage
+            .totals_since(event.timestamp - chrono::Duration::minutes(1))
+            .await
+            .unwrap();
+        assert_eq!(recent_totals.prompt_tokens, event.prompt_tokens);
     }
 }

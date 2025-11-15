@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{
     Row, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
@@ -63,6 +63,32 @@ impl Storage {
         .execute(&*self.pool)
         .await;
 
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS event_log (
+                timestamp TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                cached_prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                total_tokens INTEGER NOT NULL,
+                cost_usd REAL NOT NULL
+            );
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure event_log schema")?;
+
+        sqlx::query(
+            r#"
+            CREATE INDEX IF NOT EXISTS idx_event_log_timestamp
+            ON event_log(timestamp);
+            "#,
+        )
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to ensure event_log timestamp index")?;
+
         Ok(())
     }
 
@@ -100,6 +126,34 @@ impl Storage {
         .await
         .with_context(|| "failed to upsert daily stat")?;
 
+        Ok(())
+    }
+
+    pub async fn record_event(
+        &self,
+        timestamp: DateTime<Utc>,
+        prompt_tokens: u64,
+        cached_prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        cost_usd: f64,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO event_log (
+                timestamp, prompt_tokens, cached_prompt_tokens, completion_tokens, total_tokens, cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?);
+            "#,
+        )
+        .bind(timestamp.to_rfc3339())
+        .bind(i64::try_from(prompt_tokens).unwrap_or(i64::MAX))
+        .bind(i64::try_from(cached_prompt_tokens).unwrap_or(i64::MAX))
+        .bind(i64::try_from(completion_tokens).unwrap_or(i64::MAX))
+        .bind(i64::try_from(total_tokens).unwrap_or(i64::MAX))
+        .bind(cost_usd)
+        .execute(&*self.pool)
+        .await
+        .with_context(|| "failed to insert event log row")?;
         Ok(())
     }
 
@@ -178,6 +232,33 @@ impl Storage {
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub async fn totals_since(&self, cutoff: DateTime<Utc>) -> Result<AggregateTotals> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
+                COALESCE(SUM(completion_tokens), 0) as completion_tokens,
+                COALESCE(SUM(total_tokens), 0) as total_tokens,
+                COALESCE(SUM(cost_usd), 0.0) as cost_usd
+            FROM event_log
+            WHERE timestamp >= ?
+            "#,
+        )
+        .bind(cutoff.to_rfc3339())
+        .fetch_one(&*self.pool)
+        .await
+        .with_context(|| "failed to load totals since cutoff")?;
+
+        Ok(AggregateTotals {
+            prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+            cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0) as u64,
+            completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+            total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+            cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
+        })
     }
 }
 

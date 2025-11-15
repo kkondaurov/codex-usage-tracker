@@ -51,10 +51,10 @@ fn run_blocking(
     let loop_result: Result<()> = (|| -> Result<()> {
         loop {
             let today = Utc::now().date_naive();
+            let recent = recent_events.snapshot(Some(config.display.recent_events_capacity));
             let stats = runtime
                 .block_on(SummaryStats::gather(&storage, today))
                 .context("failed to gather summary stats")?;
-            let recent = recent_events.snapshot(Some(config.display.recent_events_capacity));
 
             terminal.draw(|frame| {
                 draw_ui(frame, &config, &stats, &recent);
@@ -113,10 +113,11 @@ fn draw_ui(frame: &mut Frame, config: &AppConfig, stats: &SummaryStats, recent: 
 fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
     let header_style = Style::default().add_modifier(Modifier::BOLD);
     let rows = vec![
+        build_summary_row("Last 10 min", &stats.last_10m, header_style),
+        build_summary_row("Last 1 hr", &stats.last_hour, header_style),
         build_summary_row("Today", &stats.today, header_style),
         build_summary_row("This Week", &stats.week, header_style),
         build_summary_row("This Month", &stats.month, header_style),
-        build_summary_row("Trailing 12M", &stats.year, header_style),
     ];
 
     let widths = [
@@ -224,10 +225,11 @@ fn format_cost(cost: f64) -> String {
 }
 
 struct SummaryStats {
+    last_10m: AggregateTotals,
+    last_hour: AggregateTotals,
     today: AggregateTotals,
     week: AggregateTotals,
     month: AggregateTotals,
-    year: AggregateTotals,
 }
 
 impl SummaryStats {
@@ -236,20 +238,22 @@ impl SummaryStats {
             .checked_sub_signed(ChronoDuration::days(6))
             .unwrap_or(today);
         let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
-        let year_start = today
-            .checked_sub_signed(ChronoDuration::days(365))
-            .unwrap_or(today);
 
+        let now = Utc::now();
+        let last_10m = storage
+            .totals_since(now - ChronoDuration::minutes(10))
+            .await?;
+        let last_hour = storage.totals_since(now - ChronoDuration::hours(1)).await?;
         let today_totals = storage.totals_between(today, today).await?;
         let week_totals = storage.totals_between(week_start, today).await?;
         let month_totals = storage.totals_between(month_start, today).await?;
-        let year_totals = storage.totals_between(year_start, today).await?;
 
         Ok(Self {
+            last_10m,
+            last_hour,
             today: today_totals,
             week: week_totals,
             month: month_totals,
-            year: year_totals,
         })
     }
 }
