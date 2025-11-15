@@ -157,6 +157,13 @@ impl PricingConfig {
                 completion_per_1k: self.default_completion_per_1k,
             })
     }
+
+    pub fn cost_for(&self, model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+        let pricing = self.price_for_model(model);
+        let prompt_cost = pricing.prompt_per_1k * (prompt_tokens as f64 / 1000.0);
+        let completion_cost = pricing.completion_per_1k * (completion_tokens as f64 / 1000.0);
+        prompt_cost + completion_cost
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -260,4 +267,26 @@ fn default_model_pricing() -> HashMap<String, ModelPricing> {
     );
 
     models
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cost_for_known_model_uses_specific_rates() {
+        let config = AppConfig::default();
+        let cost = config.pricing.cost_for("gpt-4.1", 2000, 1000); // 2k prompt, 1k completion
+        let expected = 0.0020 * 2.0 + 0.0080 * 1.0;
+        assert!((cost - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_for_unknown_model_falls_back_to_default() {
+        let mut config = AppConfig::default();
+        config.pricing.default_prompt_per_1k = 0.05;
+        config.pricing.default_completion_per_1k = 0.1;
+        let cost = config.pricing.cost_for("unknown-model", 1000, 1000);
+        assert!((cost - 0.15).abs() < f64::EPSILON);
+    }
 }

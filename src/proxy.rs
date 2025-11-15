@@ -224,13 +224,6 @@ impl ProxyState {
     fn relative_path(&self, path: &str) -> String {
         compute_relative_path(&self.public_base_path, path)
     }
-
-    fn compute_cost(&self, model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
-        let pricing = self.config.pricing.price_for_model(model);
-        let prompt_cost = pricing.prompt_per_1k * (prompt_tokens as f64 / 1000.0);
-        let completion_cost = pricing.completion_per_1k * (completion_tokens as f64 / 1000.0);
-        prompt_cost + completion_cost
-    }
 }
 
 fn normalize_public_base_path(input: &str) -> String {
@@ -340,7 +333,10 @@ fn emit_usage_event(state: &ProxyState, model_hint: Option<String>, usage: Optio
         (model_hint.unwrap_or_else(|| "unknown".to_string()), 0, 0, 0)
     };
 
-    let cost = state.compute_cost(&model_name, prompt_tokens, completion_tokens);
+    let cost = state
+        .config
+        .pricing
+        .cost_for(&model_name, prompt_tokens, completion_tokens);
 
     let event = UsageEvent {
         timestamp: Utc::now(),
