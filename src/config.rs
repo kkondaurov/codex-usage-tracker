@@ -272,7 +272,11 @@ fn default_model_pricing() -> HashMap<String, ModelPricing> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, fs, path::PathBuf};
+    use std::{
+        env, fs,
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
     use tempfile::NamedTempFile;
 
     #[test]
@@ -294,6 +298,11 @@ mod tests {
 
     #[test]
     fn load_from_file_applies_overrides() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _listen_guard = EnvGuard::unset("CODEX_USAGE_LISTEN_ADDR");
+        let _db_guard = EnvGuard::unset("CODEX_USAGE_DB_PATH");
+        let _base_guard = EnvGuard::unset("OPENAI_BASE_URL");
+
         let file = NamedTempFile::new().unwrap();
         let toml = r#"
             [server]
@@ -323,11 +332,23 @@ mod tests {
 
     #[test]
     fn env_overrides_take_precedence() {
+        let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _listen_guard = EnvGuard::set("CODEX_USAGE_LISTEN_ADDR", "127.0.0.1:7000");
         let _db_guard = EnvGuard::set("CODEX_USAGE_DB_PATH", "/tmp/codex-test.db");
         let _base_guard = EnvGuard::set("OPENAI_BASE_URL", "https://proxy.example.com/v3");
 
-        let config = AppConfig::load(None).unwrap();
+        let file = NamedTempFile::new().unwrap();
+        fs::write(
+            file.path(),
+            r#"
+            [server]
+            listen_addr = "0.0.0.0:1"
+            upstream_base_url = "https://example.com"
+            "#,
+        )
+        .unwrap();
+
+        let config = AppConfig::load(Some(file.path())).unwrap();
         assert_eq!(config.server.listen_addr, "127.0.0.1:7000");
         assert_eq!(
             config.storage.database_path,
@@ -350,6 +371,14 @@ mod tests {
             unsafe { env::set_var(key, value) };
             Self { key, previous }
         }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = env::var(key).ok();
+            if previous.is_some() {
+                unsafe { env::remove_var(key) };
+            }
+            Self { key, previous }
+        }
     }
 
     impl Drop for EnvGuard {
@@ -361,4 +390,6 @@ mod tests {
             }
         }
     }
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 }

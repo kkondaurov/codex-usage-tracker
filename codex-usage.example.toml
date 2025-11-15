@@ -16,32 +16,32 @@ currency = "USD"
 default_prompt_per_1k = 0.010
 default_completion_per_1k = 0.030
 
-[pricing.models.gpt-4.1]
+[pricing.models."gpt-4.1"]
 prompt_per_1k = 0.0020
 cached_prompt_per_1k = 0.0005
 completion_per_1k = 0.0080
 
-[pricing.models.gpt-4.1-mini]
+[pricing.models."gpt-4.1-mini"]
 prompt_per_1k = 0.00040
 cached_prompt_per_1k = 0.00010
 completion_per_1k = 0.00160
 
-[pricing.models.gpt-4.1-nano]
+[pricing.models."gpt-4.1-nano"]
 prompt_per_1k = 0.00010
 cached_prompt_per_1k = 0.000025
 completion_per_1k = 0.00040
 
-[pricing.models.gpt-4o-2024-08-06]
+[pricing.models."gpt-4o-2024-08-06"]
 prompt_per_1k = 0.00250
 cached_prompt_per_1k = 0.00125
 completion_per_1k = 0.0100
 
-[pricing.models.gpt-4o-mini-2024-07-18]
+[pricing.models."gpt-4o-mini-2024-07-18"]
 prompt_per_1k = 0.00015
 cached_prompt_per_1k = 0.000075
 completion_per_1k = 0.00060
 
-[pricing.models.o4-mini]
+[pricing.models."o4-mini"]
 prompt_per_1k = 0.0040
 cached_prompt_per_1k = 0.0010
 completion_per_1k = 0.0160

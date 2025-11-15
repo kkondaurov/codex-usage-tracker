@@ -46,7 +46,6 @@ pub fn spawn_aggregator(
 
 pub struct UsageAggregatorHandle {
     join: JoinHandle<()>,
-    #[allow(dead_code)]
     recent_events: RecentEvents,
 }
 
@@ -56,11 +55,11 @@ impl UsageAggregatorHandle {
         let _ = self.join.await;
     }
 
+    #[allow(dead_code)]
     pub async fn wait(self) {
         let _ = self.join.await;
     }
 
-    #[allow(dead_code)]
     pub fn recent_events(&self) -> RecentEvents {
         self.recent_events.clone()
     }

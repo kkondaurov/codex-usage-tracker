@@ -45,7 +45,7 @@ completion_per_1k = 0.008
 | `[storage]` | SQLite file location and sync settings | `flush_interval_secs` controls how often aggregates are forced to disk. |
 | `[display]` | TUI presentation knobs | Increase `recent_events_capacity` if you want a longer history in the table. |
 | `[pricing]` | Default currency + per-model overrides | Costs are “USD per 1K tokens”. Any model not listed uses the default prompt/completion rates. |
-| `[pricing.models.<model>]` | Model-specific prices | Model names must match what the OpenAI API returns in the `usage` block. |
+| `[pricing.models."<model>"]` | Model-specific prices | Model names must match the `model` string returned by the API; quote names containing dots. |
 
 Environment overrides:
 

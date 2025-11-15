@@ -122,6 +122,7 @@ impl Storage {
         })
     }
 
+    #[allow(dead_code)]
     pub async fn recent_daily_stats(&self, limit: i64) -> Result<Vec<DailyStatRow>> {
         let rows = sqlx::query(
             r#"
@@ -166,7 +167,9 @@ impl Storage {
 
 #[derive(Debug, Clone, Default)]
 pub struct AggregateTotals {
+    #[allow(dead_code)]
     pub prompt_tokens: u64,
+    #[allow(dead_code)]
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: f64,
