@@ -9,11 +9,12 @@ use axum::{
     extract::State,
     http::{
         HeaderMap, Request, Response, StatusCode,
-        header::{HOST, HeaderName},
+        header::{CONTENT_TYPE, HOST, HeaderName},
     },
     routing::any,
 };
 use axum_core::Error as AxumCoreError;
+use bytes::Bytes;
 use chrono::Utc;
 use http_body_util::LengthLimitError;
 use reqwest::{Client, redirect::Policy};
@@ -162,13 +163,23 @@ async fn proxy_handler(
     })?;
 
     let status = upstream_response.status();
-    let filtered_headers = filter_response_headers(upstream_response.headers());
+    let raw_headers = upstream_response.headers().clone();
+    let filtered_headers = filter_response_headers(&raw_headers);
+    let is_streaming = is_event_stream(&raw_headers);
 
-    let stream = upstream_response
-        .bytes_stream()
-        .map(|chunk| chunk.map_err(|err| io::Error::new(io::ErrorKind::Other, err)));
-
-    let body = Body::from_stream(stream);
+    let (body, response_usage) = if is_streaming {
+        let stream = upstream_response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(|err| io::Error::new(io::ErrorKind::Other, err)));
+        (Body::from_stream(stream), None)
+    } else {
+        let bytes = upstream_response.bytes().await.map_err(|err| {
+            tracing::error!(error = %err, "failed to buffer upstream response body");
+            StatusCode::BAD_GATEWAY
+        })?;
+        let usage = extract_usage_from_response_body(&bytes);
+        (Body::from(bytes), usage)
+    };
 
     let mut response = Response::builder()
         .status(status)
@@ -180,7 +191,7 @@ async fn proxy_handler(
 
     *response.headers_mut() = filtered_headers;
 
-    emit_usage_event(&state, model_hint);
+    emit_usage_event(&state, model_hint, response_usage);
 
     Ok(response)
 }
@@ -212,6 +223,13 @@ impl ProxyState {
 
     fn relative_path(&self, path: &str) -> String {
         compute_relative_path(&self.public_base_path, path)
+    }
+
+    fn compute_cost(&self, model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+        let pricing = self.config.pricing.price_for_model(model);
+        let prompt_cost = pricing.prompt_per_1k * (prompt_tokens as f64 / 1000.0);
+        let completion_cost = pricing.completion_per_1k * (completion_tokens as f64 / 1000.0);
+        prompt_cost + completion_cost
     }
 }
 
@@ -285,6 +303,14 @@ fn is_hop_by_hop_response_header(name: &HeaderName) -> bool {
         .any(|hop| lower.eq_ignore_ascii_case(hop))
 }
 
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|ct| ct.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
 fn map_body_error(err: AxumCoreError) -> StatusCode {
     if err
         .source()
@@ -298,14 +324,31 @@ fn map_body_error(err: AxumCoreError) -> StatusCode {
     }
 }
 
-fn emit_usage_event(state: &ProxyState, model_hint: Option<String>) {
+fn emit_usage_event(state: &ProxyState, model_hint: Option<String>, usage: Option<UsageMetrics>) {
+    let (model_name, prompt_tokens, completion_tokens, total_tokens) = if let Some(usage) = usage {
+        let model = usage
+            .model
+            .or_else(|| model_hint.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+        (
+            model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.total_tokens,
+        )
+    } else {
+        (model_hint.unwrap_or_else(|| "unknown".to_string()), 0, 0, 0)
+    };
+
+    let cost = state.compute_cost(&model_name, prompt_tokens, completion_tokens);
+
     let event = UsageEvent {
         timestamp: Utc::now(),
-        model: model_hint.unwrap_or_else(|| "unknown".to_string()),
-        prompt_tokens: 0,
-        completion_tokens: 0,
-        total_tokens: 0,
-        cost_usd: 0.0,
+        model: model_name,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cost_usd: cost,
     };
 
     if let Err(err) = state.usage_tx.try_send(event) {
@@ -313,7 +356,7 @@ fn emit_usage_event(state: &ProxyState, model_hint: Option<String>) {
     }
 }
 
-fn extract_model_from_request_body(body: &bytes::Bytes) -> Option<String> {
+fn extract_model_from_request_body(body: &Bytes) -> Option<String> {
     if body.is_empty() {
         return None;
     }
@@ -322,6 +365,44 @@ fn extract_model_from_request_body(body: &bytes::Bytes) -> Option<String> {
         .get("model")
         .and_then(|m| m.as_str())
         .map(|s| s.to_string())
+}
+
+#[derive(Debug, Clone)]
+struct UsageMetrics {
+    model: Option<String>,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+}
+
+fn extract_usage_from_response_body(body: &Bytes) -> Option<UsageMetrics> {
+    if body.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_slice(body).ok()?;
+    let usage = value.get("usage")?;
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(prompt_tokens + completion_tokens);
+    let model = value
+        .get("model")
+        .and_then(|m| m.as_str())
+        .map(|s| s.to_string());
+    Some(UsageMetrics {
+        model,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    })
 }
 
 #[cfg(test)]
