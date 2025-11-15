@@ -159,8 +159,24 @@ impl PricingConfig {
     }
 
     pub fn cost_for(&self, model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
+        self.cost_for_with_cached(model, prompt_tokens, 0, completion_tokens)
+    }
+
+    pub fn cost_for_with_cached(
+        &self,
+        model: &str,
+        prompt_tokens: u64,
+        cached_prompt_tokens: u64,
+        completion_tokens: u64,
+    ) -> f64 {
         let pricing = self.price_for_model(model);
-        let prompt_cost = pricing.prompt_per_1k * (prompt_tokens as f64 / 1000.0);
+        let cached = cached_prompt_tokens.min(prompt_tokens);
+        let uncached = prompt_tokens.saturating_sub(cached);
+        let cached_rate = pricing
+            .cached_prompt_per_1k
+            .unwrap_or(pricing.prompt_per_1k);
+        let prompt_cost = pricing.prompt_per_1k * (uncached as f64 / 1000.0)
+            + cached_rate * (cached as f64 / 1000.0);
         let completion_cost = pricing.completion_per_1k * (completion_tokens as f64 / 1000.0);
         prompt_cost + completion_cost
     }
@@ -266,6 +282,24 @@ fn default_model_pricing() -> HashMap<String, ModelPricing> {
         },
     );
 
+    models.insert(
+        "gpt-5.1".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00125,
+            cached_prompt_per_1k: Some(0.000125),
+            completion_per_1k: 0.0100,
+        },
+    );
+
+    models.insert(
+        "gpt-5.1-codex".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00125,
+            cached_prompt_per_1k: Some(0.000125),
+            completion_per_1k: 0.0100,
+        },
+    );
+
     models
 }
 
@@ -294,6 +328,27 @@ mod tests {
         config.pricing.default_completion_per_1k = 0.1;
         let cost = config.pricing.cost_for("unknown-model", 1000, 1000);
         assert!((cost - 0.15).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cost_for_with_cached_tokens_uses_discount_rate() {
+        let mut config = AppConfig::default();
+        config.pricing.default_prompt_per_1k = 0.1;
+        config.pricing.default_completion_per_1k = 0.2;
+        config.pricing.models.insert(
+            "custom".into(),
+            ModelPricing {
+                prompt_per_1k: 0.1,
+                cached_prompt_per_1k: Some(0.01),
+                completion_per_1k: 0.2,
+            },
+        );
+
+        let cost = config
+            .pricing
+            .cost_for_with_cached("custom", 1000, 600, 500);
+        let expected = 0.1 * 0.4 + 0.01 * 0.6 + 0.2 * 0.5;
+        assert!((cost - expected).abs() < 1e-6);
     }
 
     #[test]

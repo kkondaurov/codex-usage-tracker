@@ -113,52 +113,64 @@ fn draw_ui(frame: &mut Frame, config: &AppConfig, stats: &SummaryStats, recent: 
 fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
     let header_style = Style::default().add_modifier(Modifier::BOLD);
     let rows = vec![
-        Row::new(vec![
-            Cell::from("Today").style(header_style),
-            Cell::from(format_tokens(stats.today.total_tokens)),
-            Cell::from(format_cost(stats.today.cost_usd)),
-        ]),
-        Row::new(vec![
-            Cell::from("This Week").style(header_style),
-            Cell::from(format_tokens(stats.week.total_tokens)),
-            Cell::from(format_cost(stats.week.cost_usd)),
-        ]),
-        Row::new(vec![
-            Cell::from("This Month").style(header_style),
-            Cell::from(format_tokens(stats.month.total_tokens)),
-            Cell::from(format_cost(stats.month.cost_usd)),
-        ]),
-        Row::new(vec![
-            Cell::from("Trailing 12M").style(header_style),
-            Cell::from(format_tokens(stats.year.total_tokens)),
-            Cell::from(format_cost(stats.year.cost_usd)),
-        ]),
+        build_summary_row("Today", &stats.today, header_style),
+        build_summary_row("This Week", &stats.week, header_style),
+        build_summary_row("This Month", &stats.month, header_style),
+        build_summary_row("Trailing 12M", &stats.year, header_style),
     ];
 
     let widths = [
         Constraint::Length(16),
-        Constraint::Length(14),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(12),
+        Constraint::Length(12),
         Constraint::Length(16),
     ];
     let table = Table::new(rows, widths)
         .header(
-            Row::new(vec!["Period", "Tokens", "Cost (USD)"])
-                .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
+            Row::new(vec![
+                "Period",
+                "Input",
+                "Cached",
+                "Output",
+                "Total",
+                "Cost (USD)",
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         )
         .block(Block::default().title("Usage Totals").borders(Borders::ALL));
 
     frame.render_widget(table, area);
 }
 
+fn build_summary_row<'a>(label: &'a str, totals: &AggregateTotals, style: Style) -> Row<'a> {
+    Row::new(vec![
+        Cell::from(label).style(style),
+        Cell::from(format_tokens(totals.prompt_tokens)),
+        Cell::from(format_tokens(totals.cached_prompt_tokens)),
+        Cell::from(format_tokens(totals.completion_tokens)),
+        Cell::from(format_tokens(totals.total_tokens)),
+        Cell::from(format_cost(totals.cost_usd)),
+    ])
+}
+
 fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recent: &[UsageEvent]) {
-    let header = Row::new(vec!["Time", "Model", "Prompt", "Completion", "Cost"]).style(
+    let header = Row::new(vec!["Time", "Model", "Input", "Cached", "Output", "Cost"]).style(
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     );
 
     let rows = if recent.is_empty() {
-        vec![Row::new(vec!["–", "No recent requests", "–", "–", "–"])]
+        vec![Row::new(vec![
+            "–",
+            "No recent requests",
+            "–",
+            "–",
+            "–",
+            "–",
+        ])]
     } else {
         recent
             .iter()
@@ -168,6 +180,7 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
                     event.timestamp.format("%H:%M:%S").to_string(),
                     event.model.clone(),
                     format_tokens(event.prompt_tokens),
+                    format_tokens(event.cached_prompt_tokens),
                     format_tokens(event.completion_tokens),
                     format_cost(event.cost_usd),
                 ])
@@ -178,6 +191,7 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
     let widths = [
         Constraint::Length(10),
         Constraint::Length(20),
+        Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(12),
         Constraint::Length(12),

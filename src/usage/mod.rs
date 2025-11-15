@@ -12,6 +12,7 @@ pub struct UsageEvent {
     pub timestamp: DateTime<Utc>,
     pub model: String,
     pub prompt_tokens: u64,
+    pub cached_prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: f64,
@@ -92,6 +93,7 @@ impl UsageAggregator {
                 date,
                 &event.model,
                 event.prompt_tokens,
+                event.cached_prompt_tokens,
                 event.completion_tokens,
                 event.total_tokens,
                 event.cost_usd,
@@ -148,6 +150,7 @@ mod tests {
             timestamp: chrono::Utc.timestamp_opt(id as i64, 0).unwrap(),
             model: format!("model-{id}"),
             prompt_tokens: id as u64,
+            cached_prompt_tokens: (id / 2).max(0) as u64,
             completion_tokens: id as u64,
             total_tokens: (id * 2) as u64,
             cost_usd: id as f64 * 0.01,
@@ -193,6 +196,7 @@ mod tests {
             timestamp: chrono::Utc::now(),
             model: "gpt-4.1".to_string(),
             prompt_tokens: 120,
+            cached_prompt_tokens: 100,
             completion_tokens: 80,
             total_tokens: 200,
             cost_usd: 0.5,
@@ -205,6 +209,7 @@ mod tests {
         let day = event.timestamp.date_naive();
         let totals = storage.totals_between(day, day).await.unwrap();
         assert_eq!(totals.prompt_tokens, event.prompt_tokens);
+        assert_eq!(totals.cached_prompt_tokens, event.cached_prompt_tokens);
         assert_eq!(totals.completion_tokens, event.completion_tokens);
         assert_eq!(totals.total_tokens, event.total_tokens);
         assert!((totals.cost_usd - event.cost_usd).abs() < f64::EPSILON);

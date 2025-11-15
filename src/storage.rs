@@ -44,6 +44,7 @@ impl Storage {
                 date TEXT NOT NULL,
                 model TEXT NOT NULL,
                 prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                cached_prompt_tokens INTEGER NOT NULL DEFAULT 0,
                 completion_tokens INTEGER NOT NULL DEFAULT 0,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 cost_usd REAL NOT NULL DEFAULT 0.0,
@@ -55,6 +56,13 @@ impl Storage {
         .await
         .with_context(|| "failed to ensure daily_stats schema")?;
 
+        // Backfill cached_prompt_tokens column for existing DBs.
+        let _ = sqlx::query(
+            r#"ALTER TABLE daily_stats ADD COLUMN cached_prompt_tokens INTEGER NOT NULL DEFAULT 0;"#,
+        )
+        .execute(&*self.pool)
+        .await;
+
         Ok(())
     }
 
@@ -63,6 +71,7 @@ impl Storage {
         date: NaiveDate,
         model: &str,
         prompt_tokens: u64,
+        cached_prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
         cost_usd: f64,
@@ -70,10 +79,11 @@ impl Storage {
         sqlx::query(
             r#"
             INSERT INTO daily_stats (
-                date, model, prompt_tokens, completion_tokens, total_tokens, cost_usd
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                date, model, prompt_tokens, cached_prompt_tokens, completion_tokens, total_tokens, cost_usd
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(date, model) DO UPDATE SET
                 prompt_tokens = prompt_tokens + excluded.prompt_tokens,
+                cached_prompt_tokens = cached_prompt_tokens + excluded.cached_prompt_tokens,
                 completion_tokens = completion_tokens + excluded.completion_tokens,
                 total_tokens = total_tokens + excluded.total_tokens,
                 cost_usd = cost_usd + excluded.cost_usd;
@@ -82,6 +92,7 @@ impl Storage {
         .bind(date.to_string())
         .bind(model)
         .bind(i64::try_from(prompt_tokens).unwrap_or(i64::MAX))
+        .bind(i64::try_from(cached_prompt_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(completion_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(total_tokens).unwrap_or(i64::MAX))
         .bind(cost_usd)
@@ -101,6 +112,7 @@ impl Storage {
             r#"
             SELECT
                 COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
+                COALESCE(SUM(cached_prompt_tokens), 0) as cached_prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0) as completion_tokens,
                 COALESCE(SUM(total_tokens), 0) as total_tokens,
                 COALESCE(SUM(cost_usd), 0.0) as cost_usd
@@ -116,6 +128,7 @@ impl Storage {
 
         Ok(AggregateTotals {
             prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+            cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0) as u64,
             completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
             total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
             cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
@@ -128,6 +141,7 @@ impl Storage {
             r#"
             SELECT date, 
                    SUM(prompt_tokens) AS prompt_tokens,
+                   SUM(cached_prompt_tokens) AS cached_prompt_tokens,
                    SUM(completion_tokens) AS completion_tokens,
                    SUM(total_tokens) AS total_tokens,
                    SUM(cost_usd) AS cost_usd
@@ -150,6 +164,8 @@ impl Storage {
             results.push(DailyStatRow {
                 date,
                 prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
+                    as u64,
                 completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
                 total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
                 cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
@@ -167,10 +183,10 @@ impl Storage {
 
 #[derive(Debug, Clone, Default)]
 pub struct AggregateTotals {
-    #[allow(dead_code)]
     pub prompt_tokens: u64,
-    #[allow(dead_code)]
+    pub cached_prompt_tokens: u64,
     pub completion_tokens: u64,
+    #[allow(dead_code)]
     pub total_tokens: u64,
     pub cost_usd: f64,
 }
@@ -180,6 +196,7 @@ pub struct AggregateTotals {
 pub struct DailyStatRow {
     pub date: NaiveDate,
     pub prompt_tokens: u64,
+    pub cached_prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub cost_usd: f64,
@@ -200,20 +217,21 @@ mod tests {
         let day2 = NaiveDate::from_ymd_opt(2025, 11, 15).unwrap();
 
         storage
-            .record_daily_stat(day1, "gpt-4.1", 100, 200, 300, 0.5)
+            .record_daily_stat(day1, "gpt-4.1", 100, 80, 200, 300, 0.5)
             .await
             .unwrap();
         storage
-            .record_daily_stat(day1, "gpt-4o", 50, 50, 100, 0.2)
+            .record_daily_stat(day1, "gpt-4o", 50, 20, 50, 100, 0.2)
             .await
             .unwrap();
         storage
-            .record_daily_stat(day2, "gpt-4.1", 20, 30, 50, 0.05)
+            .record_daily_stat(day2, "gpt-4.1", 20, 5, 30, 50, 0.05)
             .await
             .unwrap();
 
         let totals = storage.totals_between(day1, day2).await.unwrap();
         assert_eq!(totals.prompt_tokens, 170);
+        assert_eq!(totals.cached_prompt_tokens, 105);
         assert_eq!(totals.completion_tokens, 280);
         assert_eq!(totals.total_tokens, 450);
         assert!((totals.cost_usd - 0.75).abs() < f64::EPSILON);

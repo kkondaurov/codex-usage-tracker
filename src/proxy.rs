@@ -14,14 +14,21 @@ use axum::{
     routing::any,
 };
 use axum_core::Error as AxumCoreError;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use http_body_util::LengthLimitError;
 use reqwest::{Client, redirect::Policy};
 use serde_json::Value;
-use std::{error::Error as StdError, io, net::SocketAddr, sync::Arc};
+use std::{
+    error::Error as StdError,
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
-use tokio_stream::StreamExt;
+use tokio_stream::{Stream, StreamExt};
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const HOP_BY_HOP_REQUEST_HEADERS: &[&str] = &[
@@ -168,10 +175,23 @@ async fn proxy_handler(
     let is_streaming = is_event_stream(&raw_headers);
 
     let (body, response_usage) = if is_streaming {
+        let (usage_tx, usage_rx) = oneshot::channel();
         let stream = upstream_response
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| io::Error::new(io::ErrorKind::Other, err)));
-        (Body::from_stream(stream), None)
+        let tapped_stream = SseUsageTap::new(stream, usage_tx);
+        let body = Body::from_stream(tapped_stream);
+
+        let state_clone = state.clone();
+        let model_hint_stream = model_hint.clone();
+        tokio::spawn(async move {
+            match usage_rx.await {
+                Ok(usage) => emit_usage_event(&state_clone, model_hint_stream, usage),
+                Err(_) => emit_usage_event(&state_clone, model_hint_stream, None),
+            }
+        });
+
+        (body, None)
     } else {
         let bytes = upstream_response.bytes().await.map_err(|err| {
             tracing::error!(error = %err, "failed to buffer upstream response body");
@@ -191,7 +211,9 @@ async fn proxy_handler(
 
     *response.headers_mut() = filtered_headers;
 
-    emit_usage_event(&state, model_hint, response_usage);
+    if !is_streaming {
+        emit_usage_event(&state, model_hint, response_usage);
+    }
 
     Ok(response)
 }
@@ -318,30 +340,41 @@ fn map_body_error(err: AxumCoreError) -> StatusCode {
 }
 
 fn emit_usage_event(state: &ProxyState, model_hint: Option<String>, usage: Option<UsageMetrics>) {
-    let (model_name, prompt_tokens, completion_tokens, total_tokens) = if let Some(usage) = usage {
-        let model = usage
-            .model
-            .or_else(|| model_hint.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-        (
-            model,
-            usage.prompt_tokens,
-            usage.completion_tokens,
-            usage.total_tokens,
-        )
-    } else {
-        (model_hint.unwrap_or_else(|| "unknown".to_string()), 0, 0, 0)
-    };
+    let (model_name, prompt_tokens, cached_prompt_tokens, completion_tokens, total_tokens) =
+        if let Some(usage) = usage {
+            let model = usage
+                .model
+                .or_else(|| model_hint.clone())
+                .unwrap_or_else(|| "unknown".to_string());
+            (
+                model,
+                usage.prompt_tokens,
+                usage.cached_prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            )
+        } else {
+            (
+                model_hint.unwrap_or_else(|| "unknown".to_string()),
+                0,
+                0,
+                0,
+                0,
+            )
+        };
 
-    let cost = state
-        .config
-        .pricing
-        .cost_for(&model_name, prompt_tokens, completion_tokens);
+    let cost = state.config.pricing.cost_for_with_cached(
+        &model_name,
+        prompt_tokens,
+        cached_prompt_tokens,
+        completion_tokens,
+    );
 
     let event = UsageEvent {
         timestamp: Utc::now(),
         model: model_name,
         prompt_tokens,
+        cached_prompt_tokens,
         completion_tokens,
         total_tokens,
         cost_usd: cost,
@@ -367,6 +400,7 @@ fn extract_model_from_request_body(body: &Bytes) -> Option<String> {
 struct UsageMetrics {
     model: Option<String>,
     prompt_tokens: u64,
+    cached_prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
 }
@@ -376,19 +410,20 @@ fn extract_usage_from_response_body(body: &Bytes) -> Option<UsageMetrics> {
         return None;
     }
     let value: Value = serde_json::from_slice(body).ok()?;
+    usage_from_value(&value)
+}
+
+fn usage_from_value(value: &Value) -> Option<UsageMetrics> {
     let usage = value.get("usage")?;
-    let prompt_tokens = usage
-        .get("prompt_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let completion_tokens = usage
-        .get("completion_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-    let total_tokens = usage
-        .get("total_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(prompt_tokens + completion_tokens);
+    let prompt_tokens = extract_token_field(usage, &["prompt_tokens", "input_tokens"]);
+    let cached_prompt_tokens = cached_tokens_from_usage(usage).min(prompt_tokens);
+    let completion_tokens = extract_token_field(usage, &["completion_tokens", "output_tokens"]);
+    let total_tokens = extract_token_field(usage, &["total_tokens"]);
+    let total_tokens = if total_tokens == 0 {
+        prompt_tokens + completion_tokens
+    } else {
+        total_tokens
+    };
     let model = value
         .get("model")
         .and_then(|m| m.as_str())
@@ -396,14 +431,157 @@ fn extract_usage_from_response_body(body: &Bytes) -> Option<UsageMetrics> {
     Some(UsageMetrics {
         model,
         prompt_tokens,
+        cached_prompt_tokens,
         completion_tokens,
         total_tokens,
     })
 }
 
+fn parse_usage_from_sse_data(payload: &str) -> Option<UsageMetrics> {
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let event_type = value.get("type").and_then(|v| v.as_str())?;
+    if event_type != "response.completed" {
+        return None;
+    }
+    let response = value.get("response")?;
+    usage_from_value(response)
+}
+
+struct SseUsageTap<S> {
+    inner: S,
+    parser: SseUsageParser,
+    usage_tx: Option<oneshot::Sender<Option<UsageMetrics>>>,
+}
+
+impl<S> SseUsageTap<S> {
+    fn new(inner: S, usage_tx: oneshot::Sender<Option<UsageMetrics>>) -> Self {
+        Self {
+            inner,
+            parser: SseUsageParser::new(),
+            usage_tx: Some(usage_tx),
+        }
+    }
+
+    fn send_usage(&mut self) {
+        if let Some(tx) = self.usage_tx.take() {
+            let usage = self.parser.take_usage();
+            let _ = tx.send(usage);
+        }
+    }
+}
+
+fn extract_token_field(usage: &Value, keys: &[&str]) -> u64 {
+    for key in keys {
+        if let Some(value) = usage.get(*key).and_then(|v| v.as_u64()) {
+            return value;
+        }
+    }
+    0
+}
+
+fn cached_tokens_from_usage(usage: &Value) -> u64 {
+    fn extract(details: Option<&Value>) -> Option<u64> {
+        details
+            .and_then(|v| v.get("cached_tokens"))
+            .and_then(|v| v.as_u64())
+    }
+
+    extract(usage.get("prompt_tokens_details"))
+        .or_else(|| extract(usage.get("input_tokens_details")))
+        .unwrap_or(0)
+}
+
+impl<S> Stream for SseUsageTap<S>
+where
+    S: Stream<Item = Result<Bytes, io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                self.parser.feed(&chunk);
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                self.send_usage();
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                self.send_usage();
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+struct SseUsageParser {
+    buffer: BytesMut,
+    usage: Option<UsageMetrics>,
+}
+
+impl SseUsageParser {
+    fn new() -> Self {
+        Self {
+            buffer: BytesMut::new(),
+            usage: None,
+        }
+    }
+
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+        while let Some(pos) = self.find_event_boundary() {
+            let event_bytes = self.buffer.split_to(pos + 2);
+            self.process_event(&event_bytes);
+        }
+    }
+
+    fn find_event_boundary(&self) -> Option<usize> {
+        let slice = &self.buffer[..];
+        for idx in 0..slice.len().saturating_sub(1) {
+            if slice[idx] == b'\n' && slice[idx + 1] == b'\n' {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn process_event(&mut self, bytes: &[u8]) {
+        let text = match std::str::from_utf8(bytes) {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+
+        let mut data_payload = String::new();
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("data:") {
+                if !data_payload.is_empty() {
+                    data_payload.push('\n');
+                }
+                data_payload.push_str(rest.trim_start());
+            }
+        }
+
+        if data_payload.is_empty() {
+            return;
+        }
+
+        tracing::trace!(payload = %data_payload, "sse event data");
+
+        if let Some(usage) = parse_usage_from_sse_data(&data_payload) {
+            self.usage = Some(usage);
+        }
+    }
+
+    fn take_usage(&mut self) -> Option<UsageMetrics> {
+        self.usage.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::compute_relative_path;
+    use super::{SseUsageParser, compute_relative_path, parse_usage_from_sse_data};
 
     #[test]
     fn relative_path_strips_exact_prefix_with_slash_boundary() {
@@ -429,5 +607,39 @@ mod tests {
             compute_relative_path("/", "/v1/chat/completions"),
             "/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn sse_usage_parser_extracts_usage() {
+        let mut parser = SseUsageParser::new();
+        let chunk = b"data: {\"type\":\"response.completed\",\"response\":{\"model\":\"gpt-4.1-mini\",\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}}\n\n";
+        parser.feed(chunk);
+        let usage = parser.take_usage().expect("usage parsed");
+        assert_eq!(usage.prompt_tokens, 12);
+        assert_eq!(usage.cached_prompt_tokens, 0);
+        assert_eq!(usage.completion_tokens, 4);
+        assert_eq!(usage.total_tokens, 16);
+        assert_eq!(usage.model.as_deref(), Some("gpt-4.1-mini"));
+    }
+
+    #[test]
+    fn parse_usage_from_sse_handles_input_output_tokens() {
+        let payload = r#"{
+            "type":"response.completed",
+            "response":{
+                "model":"gpt-4.1-mini",
+                "usage":{
+                    "input_tokens":8558,
+                    "input_tokens_details":{"cached_tokens":8448},
+                    "output_tokens":52,
+                    "total_tokens":8610
+                }
+            }
+        }"#;
+        let usage = parse_usage_from_sse_data(payload).expect("usage parsed");
+        assert_eq!(usage.prompt_tokens, 8558);
+        assert_eq!(usage.cached_prompt_tokens, 8448);
+        assert_eq!(usage.completion_tokens, 52);
+        assert_eq!(usage.total_tokens, 8610);
     }
 }
