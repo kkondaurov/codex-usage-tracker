@@ -1,10 +1,10 @@
 use crate::{
     config::AppConfig,
-    storage::{AggregateTotals, Storage},
+    storage::{AggregateTotals, ConversationAggregate, Storage},
     usage::{RecentEvents, UsageEvent},
 };
 use anyhow::{Context, Result};
-use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, TimeZone, Utc};
 use crossterm::{
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
@@ -23,6 +23,9 @@ use std::{
     time::Duration,
 };
 use tokio::runtime::Handle;
+
+const TOP_CONVERSATION_LIMIT: usize = 10;
+const DETAIL_SNIPPET_LIMIT: usize = 120;
 
 pub async fn run(
     config: Arc<AppConfig>,
@@ -47,6 +50,7 @@ fn run_blocking(
     tick_rate: Duration,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
+    let mut conversation_view = ConversationViewState::new();
 
     let loop_result: Result<()> = (|| -> Result<()> {
         loop {
@@ -55,9 +59,24 @@ fn run_blocking(
             let stats = runtime
                 .block_on(SummaryStats::gather(&storage, today))
                 .context("failed to gather summary stats")?;
+            let conversation_stats = runtime
+                .block_on(ConversationStats::gather(
+                    &storage,
+                    today,
+                    TOP_CONVERSATION_LIMIT,
+                ))
+                .context("failed to gather conversation aggregates")?;
+            conversation_view.sync_with(&conversation_stats);
 
             terminal.draw(|frame| {
-                draw_ui(frame, &config, &stats, &recent);
+                draw_ui(
+                    frame,
+                    &config,
+                    &stats,
+                    &recent,
+                    &conversation_stats,
+                    &conversation_view,
+                );
             })?;
 
             if event::poll(tick_rate)? {
@@ -67,6 +86,42 @@ fn run_blocking(
                             && key.modifiers.contains(KeyModifiers::CONTROL))
                     {
                         break Ok(());
+                    }
+
+                    match key.code {
+                        KeyCode::Left => {
+                            conversation_view.prev_period(conversation_stats.periods_len());
+                        }
+                        KeyCode::Right => {
+                            conversation_view.next_period(conversation_stats.periods_len());
+                        }
+                        KeyCode::Char('h') => {
+                            conversation_view.prev_period(conversation_stats.periods_len());
+                        }
+                        KeyCode::Char('l') => {
+                            conversation_view.next_period(conversation_stats.periods_len());
+                        }
+                        KeyCode::Up => {
+                            let rows = conversation_stats
+                                .active_period_len(conversation_view.active_period);
+                            conversation_view.move_selection_up(rows);
+                        }
+                        KeyCode::Down => {
+                            let rows = conversation_stats
+                                .active_period_len(conversation_view.active_period);
+                            conversation_view.move_selection_down(rows);
+                        }
+                        KeyCode::Char('k') => {
+                            let rows = conversation_stats
+                                .active_period_len(conversation_view.active_period);
+                            conversation_view.move_selection_up(rows);
+                        }
+                        KeyCode::Char('j') => {
+                            let rows = conversation_stats
+                                .active_period_len(conversation_view.active_period);
+                            conversation_view.move_selection_down(rows);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -100,14 +155,27 @@ fn restore_terminal(mut terminal: Terminal<CrosstermBackend<Stdout>>) -> Result<
     Ok(())
 }
 
-fn draw_ui(frame: &mut Frame, config: &AppConfig, stats: &SummaryStats, recent: &[UsageEvent]) {
+fn draw_ui(
+    frame: &mut Frame,
+    config: &AppConfig,
+    stats: &SummaryStats,
+    recent: &[UsageEvent],
+    conversations: &ConversationStats,
+    conversation_view: &ConversationViewState,
+) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(8), Constraint::Min(5)])
         .split(frame.size());
 
     render_summary(frame, layout[0], stats);
-    render_recent_events(frame, layout[1], config, recent);
+    let lower = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(layout[1]);
+
+    render_recent_events(frame, lower[0], config, recent);
+    render_conversation_panel(frame, lower[1], conversations, conversation_view);
 }
 
 fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
@@ -243,6 +311,108 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
     frame.render_widget(table, area);
 }
 
+fn render_conversation_panel(
+    frame: &mut Frame,
+    area: Rect,
+    stats: &ConversationStats,
+    view: &ConversationViewState,
+) {
+    let (label, aggregates): (&str, &[ConversationAggregate]) =
+        if let Some(period) = stats.period(view.active_period) {
+            (period.label, &period.aggregates)
+        } else {
+            ("No Data", &[])
+        };
+    let panel_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(9)])
+        .split(area);
+
+    let header = Row::new(vec![
+        "Conversation",
+        "Input",
+        "Cached",
+        "Output",
+        "Reasoning",
+        "Total",
+        "Cost",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows: Vec<Row> = if aggregates.is_empty() {
+        vec![Row::new(vec![
+            "No conversations",
+            "–",
+            "–",
+            "–",
+            "–",
+            "–",
+            "–",
+        ])]
+    } else {
+        aggregates
+            .iter()
+            .enumerate()
+            .map(|(idx, aggregate)| {
+                let mut row = Row::new(vec![
+                    format_conversation_label(aggregate.conversation_id.as_ref()),
+                    format_tokens(aggregate.prompt_tokens),
+                    format_tokens(aggregate.cached_prompt_tokens),
+                    format_tokens(aggregate.completion_tokens),
+                    format_tokens(aggregate.reasoning_tokens),
+                    format_tokens(aggregate.total_tokens),
+                    format_cost(aggregate.cost_usd),
+                ]);
+                if idx == view.selected_row {
+                    row = row.style(
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                row
+            })
+            .collect()
+    };
+
+    let widths = [
+        Constraint::Length(18),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(12),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(
+            Block::default()
+                .title(format!("Top Conversations – {}", label))
+                .borders(Borders::ALL),
+        )
+        .column_spacing(1);
+
+    frame.render_widget(table, panel_chunks[0]);
+
+    let detail_block = Block::default()
+        .title("Conversation Details (←/→ switch period, ↑/↓ select)")
+        .borders(Borders::ALL);
+    let detail_rows = view
+        .selected(stats)
+        .map(|aggregate| conversation_detail_rows(aggregate))
+        .unwrap_or_else(|| vec![Row::new(vec!["No conversation data", ""])]);
+    let detail_table = Table::new(detail_rows, [Constraint::Length(16), Constraint::Min(0)])
+        .block(detail_block)
+        .column_spacing(1);
+    frame.render_widget(detail_table, panel_chunks[1]);
+}
+
 fn format_tokens(value: u64) -> String {
     if value >= 1_000_000 {
         format!("{:.1}M", value as f64 / 1_000_000.0)
@@ -305,4 +475,230 @@ impl SummaryStats {
             month: month_totals,
         })
     }
+}
+
+struct ConversationStats {
+    periods: Vec<ConversationPeriodStats>,
+}
+
+impl ConversationStats {
+    async fn gather(storage: &Storage, today: NaiveDate, limit: usize) -> Result<Self> {
+        let now = Utc::now();
+        let week_start = today
+            .checked_sub_signed(ChronoDuration::days(6))
+            .unwrap_or(today);
+        let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+
+        let day_start = start_of_day(today);
+        let week_start_dt = start_of_day(week_start);
+        let month_start_dt = start_of_day(month_start);
+
+        let day = storage
+            .top_conversations_between(day_start, now, limit, true)
+            .await?;
+        let week = storage
+            .top_conversations_between(week_start_dt, now, limit, true)
+            .await?;
+        let month = storage
+            .top_conversations_between(month_start_dt, now, limit, true)
+            .await?;
+
+        Ok(Self {
+            periods: vec![
+                ConversationPeriodStats {
+                    label: "Today",
+                    aggregates: day,
+                },
+                ConversationPeriodStats {
+                    label: "This Week",
+                    aggregates: week,
+                },
+                ConversationPeriodStats {
+                    label: "This Month",
+                    aggregates: month,
+                },
+            ],
+        })
+    }
+
+    fn period(&self, idx: usize) -> Option<&ConversationPeriodStats> {
+        self.periods.get(idx)
+    }
+
+    fn periods_len(&self) -> usize {
+        self.periods.len()
+    }
+
+    fn active_period_len(&self, idx: usize) -> usize {
+        self.period(idx).map(|p| p.aggregates.len()).unwrap_or(0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.periods.is_empty()
+    }
+}
+
+struct ConversationPeriodStats {
+    label: &'static str,
+    aggregates: Vec<ConversationAggregate>,
+}
+
+struct ConversationViewState {
+    active_period: usize,
+    selected_row: usize,
+}
+
+impl ConversationViewState {
+    fn new() -> Self {
+        Self {
+            active_period: 0,
+            selected_row: 0,
+        }
+    }
+
+    fn sync_with(&mut self, stats: &ConversationStats) {
+        if stats.is_empty() {
+            self.active_period = 0;
+            self.selected_row = 0;
+            return;
+        }
+
+        if self.active_period >= stats.periods_len() {
+            self.active_period = stats.periods_len().saturating_sub(1);
+        }
+
+        let rows = stats.active_period_len(self.active_period);
+        if rows == 0 {
+            self.selected_row = 0;
+        } else if self.selected_row >= rows {
+            self.selected_row = rows - 1;
+        }
+    }
+
+    fn prev_period(&mut self, periods: usize) {
+        if periods == 0 {
+            return;
+        }
+        self.active_period = if self.active_period == 0 {
+            periods - 1
+        } else {
+            self.active_period - 1
+        };
+        self.selected_row = 0;
+    }
+
+    fn next_period(&mut self, periods: usize) {
+        if periods == 0 {
+            return;
+        }
+        self.active_period = (self.active_period + 1) % periods;
+        self.selected_row = 0;
+    }
+
+    fn move_selection_up(&mut self, rows: usize) {
+        if rows == 0 {
+            self.selected_row = 0;
+            return;
+        }
+        if self.selected_row > 0 {
+            self.selected_row -= 1;
+        }
+    }
+
+    fn move_selection_down(&mut self, rows: usize) {
+        if rows == 0 {
+            self.selected_row = 0;
+            return;
+        }
+        if self.selected_row + 1 < rows {
+            self.selected_row += 1;
+        }
+    }
+
+    fn selected<'a>(&self, stats: &'a ConversationStats) -> Option<&'a ConversationAggregate> {
+        stats
+            .period(self.active_period)
+            .and_then(|period| period.aggregates.get(self.selected_row))
+    }
+}
+
+fn start_of_day(date: NaiveDate) -> chrono::DateTime<Utc> {
+    let naive = date.and_hms_opt(0, 0, 0).unwrap_or_else(|| {
+        NaiveDate::from_ymd_opt(1970, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+    });
+    Utc.from_utc_datetime(&naive)
+}
+
+fn format_conversation_label(id: Option<&String>) -> String {
+    let raw = id.map(|s| s.trim()).unwrap_or("");
+    let label = if raw.is_empty() {
+        "(no conversation id)"
+    } else {
+        raw
+    };
+    truncate_text(label, 22)
+}
+
+fn full_conversation_label(id: Option<&String>) -> String {
+    let raw = id.map(|s| s.trim()).unwrap_or("");
+    if raw.is_empty() {
+        "(no conversation id)".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
+fn conversation_detail_rows(aggregate: &ConversationAggregate) -> Vec<Row<'static>> {
+    vec![
+        detail_row(
+            "Conversation",
+            full_conversation_label(aggregate.conversation_id.as_ref()),
+        ),
+        detail_row(
+            "First Prompt",
+            format_detail_snippet(aggregate.first_title.as_ref()),
+        ),
+        detail_row(
+            "Last Result",
+            format_detail_snippet(aggregate.last_summary.as_ref()),
+        ),
+    ]
+}
+
+fn detail_row(label: &'static str, value: String) -> Row<'static> {
+    Row::new(vec![
+        Cell::from(label).style(
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from(value),
+    ])
+}
+
+fn format_detail_snippet(text: Option<&String>) -> String {
+    text.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(truncate_text(trimmed, DETAIL_SNIPPET_LIMIT))
+        }
+    })
+    .unwrap_or_else(|| "—".to_string())
+}
+
+fn truncate_text(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let mut truncated = String::new();
+    for ch in input.chars().take(max_chars.saturating_sub(1)) {
+        truncated.push(ch);
+    }
+    truncated.push('…');
+    truncated
 }
