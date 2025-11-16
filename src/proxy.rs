@@ -195,16 +195,21 @@ async fn proxy_handler(
         let conversation_hint_stream = conversation_hint.clone();
         tokio::spawn(async move {
             let capture = usage_rx.await.unwrap_or_default();
-            if !emit_usage_event_from_capture(
+            let summary = capture.summary.clone();
+            let usage = capture.usage.clone();
+            emit_usage_event(
                 &state_clone,
-                capture,
                 model_hint_stream,
                 title_hint_stream,
+                summary,
                 conversation_hint_stream,
-            ) {
-                tracing::debug!(
-                    "skipping usage event for streaming response without usage metrics"
-                );
+                usage,
+            );
+
+            if capture.chat_style {
+                tracing::debug!("chat-style SSE stream detected; marking usage as not included");
+            } else if capture.usage.is_none() {
+                tracing::debug!("streaming response completed without usage metrics");
             }
         });
 
@@ -432,28 +437,6 @@ fn emit_usage_event(
     }
 }
 
-fn emit_usage_event_from_capture(
-    state: &ProxyState,
-    capture: UsageCapture,
-    model_hint: Option<String>,
-    title_hint: Option<String>,
-    conversation_hint: Option<String>,
-) -> bool {
-    if let Some(usage) = capture.usage {
-        emit_usage_event(
-            state,
-            model_hint,
-            title_hint,
-            capture.summary,
-            conversation_hint,
-            Some(usage),
-        );
-        true
-    } else {
-        false
-    }
-}
-
 fn extract_model_from_request_body(body: &Bytes) -> Option<String> {
     if body.is_empty() {
         return None;
@@ -556,16 +539,19 @@ fn extract_usage_capture_from_response(body: &Bytes) -> UsageCapture {
         return UsageCapture {
             usage: None,
             summary: None,
+            chat_style: false,
         };
     }
     match serde_json::from_slice::<Value>(body) {
         Ok(value) => UsageCapture {
             usage: usage_from_value(&value),
             summary: extract_summary_from_value(&value),
+            chat_style: false,
         },
         Err(_) => UsageCapture {
             usage: None,
             summary: None,
+            chat_style: false,
         },
     }
 }
@@ -710,6 +696,7 @@ struct UsageMetrics {
 struct UsageCapture {
     usage: Option<UsageMetrics>,
     summary: Option<String>,
+    chat_style: bool,
 }
 
 impl Default for UsageCapture {
@@ -717,6 +704,7 @@ impl Default for UsageCapture {
         Self {
             usage: None,
             summary: None,
+            chat_style: false,
         }
     }
 }
@@ -829,6 +817,7 @@ struct SseUsageParser {
     buffer: BytesMut,
     usage: Option<UsageMetrics>,
     summary_buffer: String,
+    chat_style_detected: bool,
 }
 
 impl SseUsageParser {
@@ -837,6 +826,7 @@ impl SseUsageParser {
             buffer: BytesMut::new(),
             usage: None,
             summary_buffer: String::new(),
+            chat_style_detected: false,
         }
     }
 
@@ -887,7 +877,18 @@ impl SseUsageParser {
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             return;
         };
-        let Some(kind) = value.get("type").and_then(|v| v.as_str()) else {
+        let kind = value.get("type").and_then(|v| v.as_str());
+        if kind.is_none() && value.get("choices").is_some() {
+            if value
+                .get("object")
+                .and_then(|v| v.as_str())
+                .map(|obj| obj.starts_with("chat.completion"))
+                .unwrap_or(true)
+            {
+                self.chat_style_detected = true;
+            }
+        }
+        let Some(kind) = kind else {
             return;
         };
         match kind {
@@ -895,6 +896,7 @@ impl SseUsageParser {
                 if let Some(resp) = value.get("response") {
                     if let Some(usage) = usage_from_value(resp) {
                         self.usage = Some(usage);
+                        self.chat_style_detected = false;
                     }
                 }
             }
@@ -921,6 +923,7 @@ impl SseUsageParser {
         UsageCapture {
             usage: self.usage.clone(),
             summary,
+            chat_style: self.chat_style_detected,
         }
     }
 }
@@ -928,8 +931,8 @@ impl SseUsageParser {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProxyState, SseUsageParser, UsageCapture, UsageMetrics, compute_relative_path,
-        emit_usage_event_from_capture, parse_usage_from_sse_data,
+        ProxyState, SseUsageParser, UsageMetrics, compute_relative_path, emit_usage_event,
+        parse_usage_from_sse_data,
     };
     use crate::{config::AppConfig, usage::UsageEvent};
     use reqwest::Client;
@@ -998,58 +1001,59 @@ mod tests {
     }
 
     #[test]
-    fn emit_usage_event_from_capture_skips_when_usage_missing() {
+    fn emit_usage_event_marks_usage_missing_when_none() {
         let (tx, mut rx) = mpsc::channel(1);
         let state = test_proxy_state(tx);
-        let capture = UsageCapture {
-            usage: None,
-            summary: Some("partial".to_string()),
-        };
 
-        let emitted = emit_usage_event_from_capture(
+        emit_usage_event(
             &state,
-            capture,
             Some("gpt-4.1".into()),
             Some("title".into()),
             None,
+            Some("conv-1".into()),
+            None,
         );
 
-        assert!(!emitted);
-        assert!(rx.try_recv().is_err());
+        let event = rx.try_recv().expect("usage event not emitted");
+        assert_eq!(event.model, "gpt-4.1");
+        assert_eq!(event.prompt_tokens, 0);
+        assert!(!event.usage_included);
     }
 
     #[test]
-    fn emit_usage_event_from_capture_emits_when_usage_present() {
+    fn emit_usage_event_emits_when_usage_present() {
         let (tx, mut rx) = mpsc::channel(1);
         let state = test_proxy_state(tx);
-        let capture = UsageCapture {
-            usage: Some(UsageMetrics {
-                model: Some("gpt-4.1".into()),
-                prompt_tokens: 100,
-                cached_prompt_tokens: 60,
-                completion_tokens: 30,
-                total_tokens: 130,
-            }),
-            summary: Some("answer".into()),
+        let usage = UsageMetrics {
+            model: Some("gpt-4.1".into()),
+            prompt_tokens: 100,
+            cached_prompt_tokens: 60,
+            completion_tokens: 30,
+            total_tokens: 130,
         };
 
-        let emitted = emit_usage_event_from_capture(
+        emit_usage_event(
             &state,
-            capture,
             None,
             Some("title".into()),
+            Some("answer".into()),
             Some("conv-1".into()),
+            Some(usage),
         );
 
-        assert!(emitted);
         let event = rx.try_recv().expect("usage event not emitted");
         assert_eq!(event.prompt_tokens, 100);
-        assert_eq!(event.cached_prompt_tokens, 60);
-        assert_eq!(event.completion_tokens, 30);
-        assert_eq!(event.total_tokens, 130);
-        assert_eq!(event.summary.as_deref(), Some("answer"));
-        assert_eq!(event.conversation_id.as_deref(), Some("conv-1"));
         assert!(event.usage_included);
+    }
+
+    #[test]
+    fn sse_parser_marks_chat_style_streams_without_usage() {
+        let mut parser = SseUsageParser::new();
+        let chunk = b"data: {\"object\":\"chat.completion.chunk\",\"choices\":[{\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}]}\n\n";
+        parser.feed(chunk);
+        let capture = parser.take_capture();
+        assert!(capture.chat_style);
+        assert!(capture.usage.is_none());
     }
 
     fn test_proxy_state(tx: mpsc::Sender<UsageEvent>) -> ProxyState {
