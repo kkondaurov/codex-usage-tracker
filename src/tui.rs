@@ -1,6 +1,6 @@
 use crate::{
     config::AppConfig,
-    storage::{AggregateTotals, ConversationAggregate, Storage},
+    storage::{AggregateTotals, ConversationAggregate, ConversationTurn, Storage},
     usage::{RecentEvents, UsageEvent},
 };
 use anyhow::{Context, Result};
@@ -26,6 +26,13 @@ use tokio::runtime::Handle;
 
 const TOP_CONVERSATION_LIMIT: usize = 10;
 const DETAIL_SNIPPET_LIMIT: usize = 120;
+const TURN_VIEW_LIMIT: usize = 40;
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ViewMode {
+    Overview,
+    Conversations,
+}
 
 pub async fn run(
     config: Arc<AppConfig>,
@@ -51,6 +58,7 @@ fn run_blocking(
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut conversation_view = ConversationViewState::new();
+    let mut view_mode = ViewMode::Overview;
 
     let loop_result: Result<()> = (|| -> Result<()> {
         loop {
@@ -67,6 +75,27 @@ fn run_blocking(
                 ))
                 .context("failed to gather conversation aggregates")?;
             conversation_view.sync_with(&conversation_stats);
+            let selected_conversation = if matches!(view_mode, ViewMode::Conversations) {
+                conversation_view.selected(&conversation_stats).cloned()
+            } else {
+                None
+            };
+            let conversation_turns =
+                if let (ViewMode::Conversations, Some(selected)) =
+                    (view_mode, selected_conversation.as_ref())
+                {
+                    runtime
+                        .block_on(storage.conversation_turns(
+                            selected.conversation_id.as_deref(),
+                            TURN_VIEW_LIMIT,
+                        ))
+                        .unwrap_or_else(|err| {
+                            tracing::warn!(error = %err, "failed to load conversation turns");
+                            Vec::new()
+                        })
+                } else {
+                    Vec::new()
+                };
 
             terminal.draw(|frame| {
                 draw_ui(
@@ -76,6 +105,9 @@ fn run_blocking(
                     &recent,
                     &conversation_stats,
                     &conversation_view,
+                    selected_conversation.as_ref(),
+                    &conversation_turns,
+                    view_mode,
                 );
             })?;
 
@@ -89,6 +121,12 @@ fn run_blocking(
                     }
 
                     match key.code {
+                        KeyCode::Char('c') => {
+                            view_mode = ViewMode::Conversations;
+                        }
+                        KeyCode::Char('o') | KeyCode::Esc => {
+                            view_mode = ViewMode::Overview;
+                        }
                         KeyCode::Left => {
                             conversation_view.prev_period(conversation_stats.periods_len());
                         }
@@ -162,20 +200,47 @@ fn draw_ui(
     recent: &[UsageEvent],
     conversations: &ConversationStats,
     conversation_view: &ConversationViewState,
+    selected: Option<&ConversationAggregate>,
+    turns: &[ConversationTurn],
+    view_mode: ViewMode,
+) {
+    match view_mode {
+        ViewMode::Overview => draw_overview(frame, config, stats, recent),
+        ViewMode::Conversations => {
+            draw_conversation_view(frame, conversations, conversation_view, selected, turns)
+        }
+    }
+}
+
+fn draw_overview(
+    frame: &mut Frame,
+    config: &AppConfig,
+    stats: &SummaryStats,
+    recent: &[UsageEvent],
 ) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(5)])
+        .constraints([Constraint::Length(8), Constraint::Min(10)])
         .split(frame.size());
 
     render_summary(frame, layout[0], stats);
-    let lower = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-        .split(layout[1]);
+    render_recent_events(frame, layout[1], config, recent);
+}
 
-    render_recent_events(frame, lower[0], config, recent);
-    render_conversation_panel(frame, lower[1], conversations, conversation_view);
+fn draw_conversation_view(
+    frame: &mut Frame,
+    conversations: &ConversationStats,
+    view: &ConversationViewState,
+    selected: Option<&ConversationAggregate>,
+    turns: &[ConversationTurn],
+) {
+    let layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(frame.size());
+
+    render_conversation_table(frame, layout[0], conversations, view);
+    render_conversation_panel(frame, layout[1], selected, turns);
 }
 
 fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
@@ -210,7 +275,11 @@ fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
             ])
             .style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         )
-        .block(Block::default().title("Usage Totals").borders(Borders::ALL));
+        .block(
+            Block::default()
+                .title("Usage Totals (press 'c' for Conversations view)")
+                .borders(Borders::ALL),
+        );
 
     frame.render_widget(table, area);
 }
@@ -311,7 +380,84 @@ fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recen
     frame.render_widget(table, area);
 }
 
-fn render_conversation_panel(
+fn render_conversation_metadata(
+    frame: &mut Frame,
+    area: Rect,
+    selected: Option<&ConversationAggregate>,
+) {
+    let detail_block = Block::default()
+        .title("Conversation Details (←/→ period, ↑/↓ select, 'o' to overview)")
+        .borders(Borders::ALL);
+    let rows = selected
+        .map(|aggregate| conversation_detail_rows(aggregate))
+        .unwrap_or_else(|| vec![Row::new(vec!["Selected", "None"])]);
+
+    let table = Table::new(rows, [Constraint::Length(14), Constraint::Min(0)])
+        .block(detail_block)
+        .column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn render_turn_table(
+    frame: &mut Frame,
+    area: Rect,
+    selected: Option<&ConversationAggregate>,
+    turns: &[ConversationTurn],
+) {
+    let title = selected
+        .map(|aggregate| {
+            format!(
+                "Conversation Turns – {} (full history; totals follow selected period)",
+                full_conversation_label(aggregate.conversation_id.as_ref())
+            )
+        })
+        .unwrap_or_else(|| "Conversation Turns".to_string());
+    let block = Block::default().title(title).borders(Borders::ALL);
+    let header = Row::new(vec![
+        "#", "Time", "Model", "Input", "Cached", "Output", "Total", "Reason", "Cost",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let rows: Vec<Row> = if turns.is_empty() {
+        vec![Row::new(vec!["–", "No turns", "", "", "", "", "", "", ""])]
+    } else {
+        turns
+            .iter()
+            .map(|turn| {
+                Row::new(vec![
+                    turn.turn_index.to_string(),
+                    turn.timestamp.format("%H:%M:%S").to_string(),
+                    truncate_text(&turn.model, 18),
+                    format_turn_tokens(turn.usage_included, turn.prompt_tokens),
+                    format_turn_tokens(turn.usage_included, turn.cached_prompt_tokens),
+                    format_turn_tokens(turn.usage_included, turn.completion_tokens),
+                    format_turn_tokens(turn.usage_included, turn.total_tokens),
+                    format_turn_tokens(turn.usage_included, turn.reasoning_tokens),
+                    format_turn_cost(turn.usage_included, turn.cost_usd),
+                ])
+            })
+            .collect()
+    };
+
+    let widths = [
+        Constraint::Length(3),
+        Constraint::Length(9),
+        Constraint::Length(18),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(10),
+    ];
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(block)
+        .column_spacing(1);
+    frame.render_widget(table, area);
+}
+
+fn render_conversation_table(
     frame: &mut Frame,
     area: Rect,
     stats: &ConversationStats,
@@ -323,10 +469,6 @@ fn render_conversation_panel(
         } else {
             ("No Data", &[])
         };
-    let panel_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(7), Constraint::Length(9)])
-        .split(area);
 
     let header = Row::new(vec![
         "Conversation",
@@ -393,24 +535,30 @@ fn render_conversation_panel(
         .header(header)
         .block(
             Block::default()
-                .title(format!("Top Conversations – {}", label))
+                .title(format!(
+                    "Top Conversations – {} (lifetime totals; list filtered by period)",
+                    label
+                ))
                 .borders(Borders::ALL),
         )
         .column_spacing(1);
 
-    frame.render_widget(table, panel_chunks[0]);
+    frame.render_widget(table, area);
+}
 
-    let detail_block = Block::default()
-        .title("Conversation Details (←/→ switch period, ↑/↓ select)")
-        .borders(Borders::ALL);
-    let detail_rows = view
-        .selected(stats)
-        .map(|aggregate| conversation_detail_rows(aggregate))
-        .unwrap_or_else(|| vec![Row::new(vec!["No conversation data", ""])]);
-    let detail_table = Table::new(detail_rows, [Constraint::Length(16), Constraint::Min(0)])
-        .block(detail_block)
-        .column_spacing(1);
-    frame.render_widget(detail_table, panel_chunks[1]);
+fn render_conversation_panel(
+    frame: &mut Frame,
+    area: Rect,
+    selected: Option<&ConversationAggregate>,
+    turns: &[ConversationTurn],
+) {
+    let detail_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(6)])
+        .split(area);
+
+    render_conversation_metadata(frame, detail_layout[0], selected);
+    render_turn_table(frame, detail_layout[1], selected, turns);
 }
 
 fn format_tokens(value: u64) -> String {
@@ -438,6 +586,22 @@ fn format_usage_tokens(event: &UsageEvent, value: u64) -> String {
 fn format_usage_cost(event: &UsageEvent) -> String {
     if event.usage_included {
         format_cost(event.cost_usd)
+    } else {
+        "n/a".to_string()
+    }
+}
+
+fn format_turn_tokens(included: bool, value: u64) -> String {
+    if included {
+        format_tokens(value)
+    } else {
+        "n/a".to_string()
+    }
+}
+
+fn format_turn_cost(included: bool, cost: f64) -> String {
+    if included {
+        format_cost(cost)
     } else {
         "n/a".to_string()
     }
@@ -664,6 +828,10 @@ fn conversation_detail_rows(aggregate: &ConversationAggregate) -> Vec<Row<'stati
         detail_row(
             "Last Result",
             format_detail_snippet(aggregate.last_summary.as_ref()),
+        ),
+        detail_row(
+            "Data Scope",
+            "Lifetime totals & turns; period only filters which conversations appear".to_string(),
         ),
     ]
 }

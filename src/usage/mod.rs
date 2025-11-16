@@ -96,6 +96,7 @@ impl UsageAggregator {
         self.storage
             .record_event(
                 event.timestamp,
+                &event.model,
                 event.title.as_deref(),
                 event.summary.as_deref(),
                 event.conversation_id.as_deref(),

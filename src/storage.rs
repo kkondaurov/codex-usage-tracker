@@ -73,6 +73,7 @@ impl Storage {
             r#"
             CREATE TABLE IF NOT EXISTS event_log (
                 timestamp TEXT NOT NULL,
+                model TEXT NOT NULL,
                 title TEXT,
                 summary TEXT,
                 conversation_id TEXT,
@@ -106,6 +107,11 @@ impl Storage {
         .await;
         let _ = sqlx::query(
             r#"ALTER TABLE event_log ADD COLUMN usage_included INTEGER NOT NULL DEFAULT 1;"#,
+        )
+        .execute(&*self.pool)
+        .await;
+        let _ = sqlx::query(
+            r#"ALTER TABLE event_log ADD COLUMN model TEXT NOT NULL DEFAULT 'unknown';"#,
         )
         .execute(&*self.pool)
         .await;
@@ -176,6 +182,7 @@ impl Storage {
     pub async fn record_event(
         &self,
         timestamp: DateTime<Utc>,
+        model: &str,
         title: Option<&str>,
         summary: Option<&str>,
         conversation_id: Option<&str>,
@@ -190,11 +197,12 @@ impl Storage {
         sqlx::query(
             r#"
             INSERT INTO event_log (
-                timestamp, title, summary, conversation_id, prompt_tokens, cached_prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cost_usd, usage_included
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                timestamp, model, title, summary, conversation_id, prompt_tokens, cached_prompt_tokens, completion_tokens, total_tokens, reasoning_tokens, cost_usd, usage_included
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             "#,
         )
         .bind(timestamp.to_rfc3339())
+        .bind(model)
         .bind(title)
         .bind(summary)
         .bind(conversation_id)
@@ -330,7 +338,7 @@ impl Storage {
     ) -> Result<Vec<ConversationAggregate>> {
         let rows = sqlx::query(
             r#"
-            WITH filtered AS (
+            WITH all_events AS (
                 SELECT
                     COALESCE(conversation_id, '__unlabeled__') AS conv_key,
                     conversation_id,
@@ -344,8 +352,23 @@ impl Storage {
                     reasoning_tokens,
                     cost_usd
                 FROM event_log
+            ),
+            filtered AS (
+                SELECT *
+                FROM all_events
                 WHERE timestamp BETWEEN ?1 AND ?2
                   AND (?3 = 1 OR conversation_id IS NOT NULL)
+            ),
+            filtered_keys AS (
+                SELECT DISTINCT conv_key FROM filtered
+            ),
+            period_stats AS (
+                SELECT
+                    conv_key,
+                    SUM(cost_usd) AS period_cost,
+                    SUM(prompt_tokens) AS period_prompt
+                FROM filtered
+                GROUP BY conv_key
             ),
             aggregates AS (
                 SELECT
@@ -357,7 +380,7 @@ impl Storage {
                     SUM(total_tokens) AS total_tokens,
                     SUM(reasoning_tokens) AS reasoning_tokens,
                     SUM(cost_usd) AS cost_usd
-                FROM filtered
+                FROM all_events
                 GROUP BY conv_key
             ),
             first_prompts AS (
@@ -370,7 +393,7 @@ impl Storage {
                             PARTITION BY conv_key
                             ORDER BY timestamp ASC
                         ) AS rn
-                    FROM filtered
+                    FROM all_events
                     WHERE title IS NOT NULL AND LENGTH(TRIM(title)) > 0
                 )
                 WHERE rn = 1
@@ -385,7 +408,7 @@ impl Storage {
                             PARTITION BY conv_key
                             ORDER BY timestamp DESC
                         ) AS rn
-                    FROM filtered
+                    FROM all_events
                     WHERE summary IS NOT NULL AND LENGTH(TRIM(summary)) > 0
                 )
                 WHERE rn = 1
@@ -401,9 +424,12 @@ impl Storage {
                 first_prompts.first_title,
                 last_summaries.last_summary
             FROM aggregates
+            JOIN filtered_keys ON filtered_keys.conv_key = aggregates.conv_key
+            LEFT JOIN period_stats ON period_stats.conv_key = aggregates.conv_key
             LEFT JOIN first_prompts ON first_prompts.conv_key = aggregates.conv_key
             LEFT JOIN last_summaries ON last_summaries.conv_key = aggregates.conv_key
-            ORDER BY aggregates.cost_usd DESC, aggregates.prompt_tokens DESC
+            ORDER BY COALESCE(period_stats.period_cost, 0) DESC,
+                     COALESCE(period_stats.period_prompt, 0) DESC
             LIMIT ?4
             "#,
         )
@@ -508,6 +534,73 @@ impl Storage {
             last_summary: None,
         }))
     }
+
+    pub async fn conversation_turns(
+        &self,
+        conversation_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ConversationTurn>> {
+        let rows = match conversation_id {
+            Some(id) => {
+                sqlx::query(
+                    r#"
+                SELECT timestamp, model, prompt_tokens, cached_prompt_tokens,
+                       completion_tokens, total_tokens, reasoning_tokens,
+                       cost_usd, usage_included
+                FROM event_log
+                WHERE conversation_id = ?1
+                ORDER BY timestamp ASC
+                LIMIT ?2
+                "#,
+                )
+                .bind(id)
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_all(&*self.pool)
+                .await
+            }
+            None => {
+                sqlx::query(
+                    r#"
+                SELECT timestamp, model, prompt_tokens, cached_prompt_tokens,
+                       completion_tokens, total_tokens, reasoning_tokens,
+                       cost_usd, usage_included
+                FROM event_log
+                WHERE conversation_id IS NULL
+                ORDER BY timestamp ASC
+                LIMIT ?1
+                "#,
+                )
+                .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+                .fetch_all(&*self.pool)
+                .await
+            }
+        }
+        .with_context(|| "failed to load conversation turns")?;
+
+        let mut turns = Vec::with_capacity(rows.len());
+        for (idx, row) in rows.into_iter().enumerate() {
+            let timestamp_str: String = row.try_get("timestamp")?;
+            let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .with_context(|| "invalid timestamp in event_log")?;
+
+            turns.push(ConversationTurn {
+                turn_index: idx as u32 + 1,
+                timestamp,
+                model: row.try_get::<String, _>("model")?,
+                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
+                    as u64,
+                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                cost_usd: row.try_get::<f64, _>("cost_usd").unwrap_or(0.0),
+                usage_included: row.try_get::<i64, _>("usage_included").unwrap_or(1) != 0,
+            });
+        }
+
+        Ok(turns)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -532,6 +625,20 @@ pub struct ConversationAggregate {
     pub cost_usd: f64,
     pub first_title: Option<String>,
     pub last_summary: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConversationTurn {
+    pub turn_index: u32,
+    pub timestamp: DateTime<Utc>,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub cached_prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub reasoning_tokens: u64,
+    pub cost_usd: f64,
+    pub usage_included: bool,
 }
 
 #[allow(dead_code)]
@@ -605,6 +712,7 @@ mod tests {
         storage
             .record_event(
                 base - ChronoDuration::minutes(30),
+                "gpt-test",
                 Some("First question from A"),
                 Some("resp-a"),
                 Some("conv-a"),
@@ -622,6 +730,7 @@ mod tests {
         storage
             .record_event(
                 base - ChronoDuration::minutes(20),
+                "gpt-test",
                 Some("First question from B"),
                 Some("resp-b1"),
                 Some("conv-b"),
@@ -639,6 +748,7 @@ mod tests {
         storage
             .record_event(
                 base - ChronoDuration::minutes(10),
+                "gpt-test",
                 Some("Follow-up B"),
                 Some("resp-b2-final"),
                 Some("conv-b"),
@@ -653,9 +763,29 @@ mod tests {
             .await
             .unwrap();
 
+        // Event outside the filtered window should still contribute to lifetime totals.
+        storage
+            .record_event(
+                base - ChronoDuration::hours(3),
+                "gpt-test",
+                Some("earlier B"),
+                Some("resp-old"),
+                Some("conv-b"),
+                50,
+                5,
+                20,
+                70,
+                4,
+                0.3,
+                true,
+            )
+            .await
+            .unwrap();
+
         storage
             .record_event(
                 base - ChronoDuration::minutes(5),
+                "gpt-test",
                 Some("Misc request"),
                 Some("misc result"),
                 None,
@@ -677,8 +807,9 @@ mod tests {
 
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].conversation_id.as_deref(), Some("conv-b"));
-        assert_eq!(all[0].cost_usd, 2.5);
-        assert_eq!(all[0].first_title.as_deref(), Some("First question from B"));
+        assert!((all[0].cost_usd - 2.8).abs() < f64::EPSILON);
+        assert_eq!(all[0].prompt_tokens, 330);
+        assert_eq!(all[0].first_title.as_deref(), Some("earlier B"));
         assert_eq!(all[0].last_summary.as_deref(), Some("resp-b2-final"));
         assert_eq!(all[1].conversation_id.as_deref(), Some("conv-a"));
         assert_eq!(all[1].prompt_tokens, 100);
@@ -707,6 +838,7 @@ mod tests {
         storage
             .record_event(
                 base - ChronoDuration::minutes(45),
+                "gpt-test",
                 Some("t1"),
                 None,
                 Some("conv-z"),
@@ -724,6 +856,7 @@ mod tests {
         storage
             .record_event(
                 base - ChronoDuration::minutes(30),
+                "gpt-test",
                 Some("t2"),
                 None,
                 None,
@@ -753,5 +886,52 @@ mod tests {
             .unwrap();
         assert!(none_bucket.conversation_id.is_none());
         assert_eq!(none_bucket.total_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn conversation_turns_returns_ordered_events() {
+        let db_file = NamedTempFile::new().unwrap();
+        let storage = Storage::connect(db_file.path()).await.unwrap();
+        storage.ensure_schema().await.unwrap();
+
+        let base = Utc::now();
+        for (offset, title, summary, conv, prompt, completion, cost) in [
+            (60, "first", "done1", Some("conv-x"), 100, 50, 0.5),
+            (30, "second", "done2", Some("conv-x"), 120, 60, 0.7),
+            (15, "other", "nil", None, 40, 10, 0.2),
+        ] {
+            storage
+                .record_event(
+                    base - ChronoDuration::seconds(offset),
+                    "gpt-turn",
+                    Some(title),
+                    Some(summary),
+                    conv,
+                    prompt,
+                    10,
+                    completion,
+                    prompt + completion,
+                    0,
+                    cost,
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+
+        let turns = storage
+            .conversation_turns(Some("conv-x"), 10)
+            .await
+            .unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].turn_index, 1);
+        assert_eq!(turns[0].prompt_tokens, 100);
+        assert_eq!(turns[1].turn_index, 2);
+        assert_eq!(turns[1].completion_tokens, 60);
+
+        let unlabeled = storage.conversation_turns(None, 10).await.unwrap();
+        assert_eq!(unlabeled.len(), 1);
+        assert_eq!(unlabeled[0].turn_index, 1);
+        assert_eq!(unlabeled[0].prompt_tokens, 40);
     }
 }
