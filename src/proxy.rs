@@ -194,18 +194,18 @@ async fn proxy_handler(
         let title_hint_stream = title_hint.clone();
         let conversation_hint_stream = conversation_hint.clone();
         tokio::spawn(async move {
-            let capture = usage_rx.await.unwrap_or(UsageCapture {
-                usage: None,
-                summary: None,
-            });
-            emit_usage_event(
+            let capture = usage_rx.await.unwrap_or_default();
+            if !emit_usage_event_from_capture(
                 &state_clone,
+                capture,
                 model_hint_stream,
                 title_hint_stream,
-                capture.summary.clone(),
                 conversation_hint_stream,
-                capture.usage,
-            );
+            ) {
+                tracing::debug!(
+                    "skipping usage event for streaming response without usage metrics"
+                );
+            }
         });
 
         (body, None)
@@ -427,6 +427,28 @@ fn emit_usage_event(
 
     if let Err(err) = state.usage_tx.try_send(event) {
         tracing::warn!(error = %err, "failed to enqueue usage event");
+    }
+}
+
+fn emit_usage_event_from_capture(
+    state: &ProxyState,
+    capture: UsageCapture,
+    model_hint: Option<String>,
+    title_hint: Option<String>,
+    conversation_hint: Option<String>,
+) -> bool {
+    if let Some(usage) = capture.usage {
+        emit_usage_event(
+            state,
+            model_hint,
+            title_hint,
+            capture.summary,
+            conversation_hint,
+            Some(usage),
+        );
+        true
+    } else {
+        false
     }
 }
 
@@ -688,6 +710,15 @@ struct UsageCapture {
     summary: Option<String>,
 }
 
+impl Default for UsageCapture {
+    fn default() -> Self {
+        Self {
+            usage: None,
+            summary: None,
+        }
+    }
+}
+
 fn usage_from_value(value: &Value) -> Option<UsageMetrics> {
     let usage = value.get("usage")?;
     let prompt_tokens = extract_token_field(usage, &["prompt_tokens", "input_tokens"]);
@@ -893,7 +924,14 @@ impl SseUsageParser {
 
 #[cfg(test)]
 mod tests {
-    use super::{SseUsageParser, compute_relative_path, parse_usage_from_sse_data};
+    use super::{
+        ProxyState, SseUsageParser, UsageCapture, UsageMetrics, compute_relative_path,
+        emit_usage_event_from_capture, parse_usage_from_sse_data,
+    };
+    use crate::{config::AppConfig, usage::UsageEvent};
+    use reqwest::Client;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
 
     #[test]
     fn relative_path_strips_exact_prefix_with_slash_boundary() {
@@ -954,5 +992,69 @@ mod tests {
         assert_eq!(usage.cached_prompt_tokens, 8448);
         assert_eq!(usage.completion_tokens, 52);
         assert_eq!(usage.total_tokens, 8610);
+    }
+
+    #[test]
+    fn emit_usage_event_from_capture_skips_when_usage_missing() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = test_proxy_state(tx);
+        let capture = UsageCapture {
+            usage: None,
+            summary: Some("partial".to_string()),
+        };
+
+        let emitted = emit_usage_event_from_capture(
+            &state,
+            capture,
+            Some("gpt-4.1".into()),
+            Some("title".into()),
+            None,
+        );
+
+        assert!(!emitted);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn emit_usage_event_from_capture_emits_when_usage_present() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let state = test_proxy_state(tx);
+        let capture = UsageCapture {
+            usage: Some(UsageMetrics {
+                model: Some("gpt-4.1".into()),
+                prompt_tokens: 100,
+                cached_prompt_tokens: 60,
+                completion_tokens: 30,
+                total_tokens: 130,
+            }),
+            summary: Some("answer".into()),
+        };
+
+        let emitted = emit_usage_event_from_capture(
+            &state,
+            capture,
+            None,
+            Some("title".into()),
+            Some("conv-1".into()),
+        );
+
+        assert!(emitted);
+        let event = rx.try_recv().expect("usage event not emitted");
+        assert_eq!(event.prompt_tokens, 100);
+        assert_eq!(event.cached_prompt_tokens, 60);
+        assert_eq!(event.completion_tokens, 30);
+        assert_eq!(event.total_tokens, 130);
+        assert_eq!(event.summary.as_deref(), Some("answer"));
+        assert_eq!(event.conversation_id.as_deref(), Some("conv-1"));
+    }
+
+    fn test_proxy_state(tx: mpsc::Sender<UsageEvent>) -> ProxyState {
+        ProxyState {
+            config: Arc::new(AppConfig::default()),
+            usage_tx: tx,
+            client: Client::builder().build().expect("client"),
+            upstream_base: "https://api.openai.com/v1".into(),
+            public_base_path: "/v1".into(),
+        }
     }
 }
