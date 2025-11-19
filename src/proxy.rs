@@ -8,31 +8,44 @@ use axum::{
     body::{self, Body},
     extract::State,
     http::{
-        HeaderMap, Request, Response, StatusCode,
+        HeaderMap, Request, Response, StatusCode, Uri,
         header::{CONTENT_TYPE, HOST, HeaderName},
     },
     routing::any,
 };
 use axum_core::Error as AxumCoreError;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use bytes::{Bytes, BytesMut};
-use chrono::Utc;
+use chrono::{SecondsFormat, Utc};
 use http_body_util::LengthLimitError;
 use reqwest::{Client, redirect::Policy};
+use serde::Serialize;
 use serde_json::Value;
 use std::{
     error::Error as StdError,
     io,
     net::SocketAddr,
+    path::PathBuf,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context as TaskContext, Poll},
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{
+    fs::OpenOptions,
+    io::AsyncWriteExt,
+    net::TcpListener,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tokio_stream::{Stream, StreamExt};
 
 const MAX_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 const TITLE_MAX_CHARS: usize = 100;
 const SUMMARY_MAX_CHARS: usize = 160;
+const LOG_QUEUE_CAPACITY: usize = 4096;
 const HOP_BY_HOP_REQUEST_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
@@ -56,6 +69,216 @@ const HOP_BY_HOP_RESPONSE_HEADERS: &[&str] = &[
     "proxy-connection",
 ];
 
+#[derive(Serialize, serde::Deserialize)]
+struct HeaderEntry {
+    name: String,
+    value: String,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+struct BodyEntry {
+    len: usize,
+    encoding: String,
+    data: String,
+}
+
+#[derive(Serialize, serde::Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum LogEntry {
+    Request {
+        id: String,
+        timestamp: String,
+        method: String,
+        url: String,
+        headers: Vec<HeaderEntry>,
+        body: BodyEntry,
+    },
+    Response {
+        id: String,
+        timestamp: String,
+        status: u16,
+        streaming: bool,
+        headers: Vec<HeaderEntry>,
+        body: Option<BodyEntry>,
+    },
+    ResponseChunk {
+        id: String,
+        timestamp: String,
+        chunk: BodyEntry,
+    },
+    ResponseStreamEnd {
+        id: String,
+        timestamp: String,
+        reason: String,
+    },
+}
+
+#[derive(Clone)]
+struct RequestLogger {
+    inner: Arc<LoggerInner>,
+}
+
+struct LoggerInner {
+    tx: mpsc::Sender<LogEntry>,
+    counter: AtomicU64,
+}
+
+struct LoggerHandle {
+    join: JoinHandle<()>,
+}
+
+impl LoggerHandle {
+    async fn shutdown(self) {
+        let _ = self.join.await;
+    }
+}
+
+impl RequestLogger {
+    async fn new(path: PathBuf) -> Result<(LoggerHandle, Self)> {
+        let (tx, rx) = mpsc::channel::<LogEntry>(LOG_QUEUE_CAPACITY);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("failed to open request log file {}", path.display()))?;
+
+        let path_for_task = path.clone();
+        let mut rx = rx;
+        let join = tokio::spawn(async move {
+            let mut file = file;
+            while let Some(entry) = rx.recv().await {
+                if let Ok(line) = serde_json::to_string(&entry) {
+                    if let Err(err) = file.write_all(line.as_bytes()).await {
+                        tracing::error!(
+                            error = %err,
+                            path = %path_for_task.display(),
+                            "failed to write request log entry"
+                        );
+                        continue;
+                    }
+                    let _ = file.write_all(b"\n").await;
+                }
+            }
+        });
+
+        let logger = Self {
+            inner: Arc::new(LoggerInner {
+                tx,
+                counter: AtomicU64::new(1),
+            }),
+        };
+
+        Ok((LoggerHandle { join }, logger))
+    }
+
+    fn next_id(&self) -> String {
+        let seq = self.inner.counter.fetch_add(1, Ordering::Relaxed);
+        format!("req-{seq}")
+    }
+
+    fn log_request(&self, id: &str, uri: &Uri, method: &str, headers: &HeaderMap, body: &Bytes) {
+        let entry = LogEntry::Request {
+            id: id.to_string(),
+            timestamp: Self::timestamp(),
+            method: method.to_string(),
+            url: uri.to_string(),
+            headers: Self::encode_headers(headers),
+            body: Self::encode_body(body),
+        };
+        if let Err(err) = self.inner.tx.try_send(entry) {
+            tracing::warn!(error = %err, "request log channel full; dropping request entry");
+        }
+    }
+
+    fn log_response(
+        &self,
+        id: &str,
+        status: StatusCode,
+        headers: &HeaderMap,
+        body: Option<&Bytes>,
+        streaming: bool,
+    ) {
+        let entry = LogEntry::Response {
+            id: id.to_string(),
+            timestamp: Self::timestamp(),
+            status: status.as_u16(),
+            streaming,
+            headers: Self::encode_headers(headers),
+            body: body.map(Self::encode_body),
+        };
+        if let Err(err) = self.inner.tx.try_send(entry) {
+            tracing::warn!(error = %err, "request log channel full; dropping response entry");
+        }
+    }
+
+    fn log_stream_chunk(&self, id: &str, chunk: &Bytes) {
+        let entry = LogEntry::ResponseChunk {
+            id: id.to_string(),
+            timestamp: Self::timestamp(),
+            chunk: Self::encode_body(chunk),
+        };
+        if let Err(err) = self.inner.tx.try_send(entry) {
+            tracing::warn!(error = %err, "request log channel full; dropping response chunk");
+        }
+    }
+
+    fn log_stream_end(&self, id: &str, reason: &str) {
+        let entry = LogEntry::ResponseStreamEnd {
+            id: id.to_string(),
+            timestamp: Self::timestamp(),
+            reason: reason.to_string(),
+        };
+        if let Err(err) = self.inner.tx.try_send(entry) {
+            tracing::warn!(error = %err, "request log channel full; dropping stream end marker");
+        }
+    }
+
+    fn encode_headers(headers: &HeaderMap) -> Vec<HeaderEntry> {
+        const REDACT: &[&str] = &[
+            "authorization",
+            "proxy-authorization",
+            "x-api-key",
+            "api-key",
+            "cookie",
+            "set-cookie",
+        ];
+        headers
+            .iter()
+            .map(|(name, value)| HeaderEntry {
+                name: name.to_string(),
+                value: if REDACT.iter().any(|h| name.as_str().eq_ignore_ascii_case(h)) {
+                    "<redacted>".to_string()
+                } else {
+                    value
+                        .to_str()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|_| "<non-utf8>".to_string())
+                },
+            })
+            .collect()
+    }
+
+    fn encode_body(bytes: &Bytes) -> BodyEntry {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => BodyEntry {
+                len: bytes.len(),
+                encoding: "utf8".to_string(),
+                data: text.to_string(),
+            },
+            Err(_) => BodyEntry {
+                len: bytes.len(),
+                encoding: "base64".to_string(),
+                data: BASE64.encode(bytes),
+            },
+        }
+    }
+
+    fn timestamp() -> String {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+}
 #[derive(Clone)]
 struct ProxyState {
     #[allow(dead_code)]
@@ -64,11 +287,13 @@ struct ProxyState {
     client: Client,
     upstream_base: String,
     public_base_path: String,
+    request_logger: Option<RequestLogger>,
 }
 
 pub struct ProxyHandle {
     shutdown: Option<oneshot::Sender<()>>,
     join: JoinHandle<Result<()>>,
+    logger_handle: Option<LoggerHandle>,
 }
 
 pub async fn spawn(config: Arc<AppConfig>, usage_tx: UsageEventSender) -> Result<ProxyHandle> {
@@ -77,6 +302,13 @@ pub async fn spawn(config: Arc<AppConfig>, usage_tx: UsageEventSender) -> Result
         .listen_addr
         .parse()
         .with_context(|| "failed to parse listen_addr")?;
+
+    let (logger_handle, request_logger) = if let Some(path) = &config.server.request_log_path {
+        let (handle, logger) = RequestLogger::new(path.clone()).await?;
+        (Some(handle), Some(logger))
+    } else {
+        (None, None)
+    };
 
     let client = Client::builder()
         .user_agent("codex-usage-proxy/0.1")
@@ -100,6 +332,7 @@ pub async fn spawn(config: Arc<AppConfig>, usage_tx: UsageEventSender) -> Result
         client,
         upstream_base,
         public_base_path,
+        request_logger,
     });
 
     let router = Router::new()
@@ -121,10 +354,18 @@ pub async fn spawn(config: Arc<AppConfig>, usage_tx: UsageEventSender) -> Result
     });
 
     tracing::info!(listen = %addr, upstream = %state.upstream_base, "proxy listener started");
+    if let Some(logger) = &state.request_logger {
+        tracing::info!(
+            "request/response body logging ENABLED via CODEX_USAGE_LOG_FILE; bodies are persisted (UTF-8 or base64), sensitive headers are redacted, and log queue is bounded to {} entries",
+            LOG_QUEUE_CAPACITY
+        );
+        let _ = logger; // silence unused warning if logging level filters it out
+    }
 
     Ok(ProxyHandle {
         shutdown: Some(shutdown_tx),
         join,
+        logger_handle,
     })
 }
 
@@ -133,7 +374,11 @@ impl ProxyHandle {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
-        match self.join.await {
+        let server_result = self.join.await;
+        if let Some(logger) = self.logger_handle.take() {
+            logger.shutdown().await;
+        }
+        match server_result {
             Ok(result) => result,
             Err(err) => Err(anyhow!(err)),
         }
@@ -144,15 +389,22 @@ async fn proxy_handler(
     State(state): State<Arc<ProxyState>>,
     req: Request<Body>,
 ) -> Result<Response<Body>, StatusCode> {
-    let upstream_url = state.build_upstream_url(&req);
+    let request_id = state
+        .request_logger
+        .as_ref()
+        .map(|logger| logger.next_id())
+        .unwrap_or_else(|| format!("req-{}", Utc::now().timestamp_millis()));
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
 
-    let mut request_builder = state
-        .client
-        .request(req.method().clone(), upstream_url.clone());
+    let upstream_url = state.build_upstream_url(&uri);
 
-    let conversation_header_hint = extract_conversation_id_from_headers(req.headers());
+    let mut request_builder = state.client.request(method.clone(), upstream_url.clone());
 
-    for (name, value) in req.headers().iter() {
+    let conversation_header_hint = extract_conversation_id_from_headers(&headers);
+
+    for (name, value) in headers.iter() {
         if *name == HOST || is_hop_by_hop_request_header(name) {
             continue;
         }
@@ -166,7 +418,9 @@ async fn proxy_handler(
     let title_hint = extract_title_from_request_body(&body_bytes);
     let conversation_hint =
         conversation_header_hint.or_else(|| extract_conversation_id_from_body(&body_bytes));
-
+    if let Some(logger) = &state.request_logger {
+        logger.log_request(&request_id, &uri, method.as_str(), &headers, &body_bytes);
+    }
     if !body_bytes.is_empty() {
         request_builder = request_builder.body(body_bytes);
     }
@@ -181,12 +435,17 @@ async fn proxy_handler(
     let filtered_headers = filter_response_headers(&raw_headers);
     let is_streaming = is_event_stream(&raw_headers);
 
+    if let Some(logger) = &state.request_logger {
+        logger.log_response(&request_id, status, &raw_headers, None, is_streaming);
+    }
+
     let (body, response_capture) = if is_streaming {
         let (usage_tx, usage_rx) = oneshot::channel();
         let stream = upstream_response
             .bytes_stream()
             .map(|chunk| chunk.map_err(|err| io::Error::new(io::ErrorKind::Other, err)));
-        let tapped_stream = SseUsageTap::new(stream, usage_tx);
+        let tapped_stream =
+            SseUsageTap::new(stream, usage_tx, request_id, state.request_logger.clone());
         let body = Body::from_stream(tapped_stream);
 
         let state_clone = state.clone();
@@ -220,6 +479,9 @@ async fn proxy_handler(
             StatusCode::BAD_GATEWAY
         })?;
         let capture = extract_usage_capture_from_response(&bytes);
+        if let Some(logger) = &state.request_logger {
+            logger.log_response(&request_id, status, &raw_headers, Some(&bytes), false);
+        }
         (Body::from(bytes), Some(capture))
     };
 
@@ -259,8 +521,8 @@ async fn proxy_handler(
 }
 
 impl ProxyState {
-    fn build_upstream_url(&self, req: &Request<Body>) -> String {
-        let path = req.uri().path();
+    fn build_upstream_url(&self, uri: &Uri) -> String {
+        let path = uri.path();
         let rel = self.relative_path(path);
         let mut url = self.upstream_base.clone();
 
@@ -275,7 +537,7 @@ impl ProxyState {
             url.push_str(rel.trim_start_matches('/'));
         }
 
-        if let Some(query) = req.uri().query() {
+        if let Some(query) = uri.query() {
             url.push('?');
             url.push_str(query);
         }
@@ -760,14 +1022,23 @@ struct SseUsageTap<S> {
     inner: S,
     parser: SseUsageParser,
     usage_tx: Option<oneshot::Sender<UsageCapture>>,
+    logger: Option<RequestLogger>,
+    request_id: String,
 }
 
 impl<S> SseUsageTap<S> {
-    fn new(inner: S, usage_tx: oneshot::Sender<UsageCapture>) -> Self {
+    fn new(
+        inner: S,
+        usage_tx: oneshot::Sender<UsageCapture>,
+        request_id: String,
+        logger: Option<RequestLogger>,
+    ) -> Self {
         Self {
             inner,
             parser: SseUsageParser::new(),
             usage_tx: Some(usage_tx),
+            logger,
+            request_id,
         }
     }
 
@@ -775,6 +1046,18 @@ impl<S> SseUsageTap<S> {
         if let Some(tx) = self.usage_tx.take() {
             let capture = self.parser.take_capture();
             let _ = tx.send(capture);
+        }
+    }
+
+    fn log_chunk(&self, chunk: &Bytes) {
+        if let Some(logger) = &self.logger {
+            logger.log_stream_chunk(&self.request_id, chunk);
+        }
+    }
+
+    fn log_stream_end(&self, reason: &str) {
+        if let Some(logger) = &self.logger {
+            logger.log_stream_end(&self.request_id, reason);
         }
     }
 }
@@ -819,14 +1102,17 @@ where
         match Pin::new(&mut self.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(chunk))) => {
                 self.parser.feed(&chunk);
+                self.log_chunk(&chunk);
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(err))) => {
                 self.send_usage();
+                self.log_stream_end("error");
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
                 self.send_usage();
+                self.log_stream_end("end");
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -952,10 +1238,12 @@ impl SseUsageParser {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProxyState, SseUsageParser, UsageMetrics, compute_relative_path, emit_usage_event,
-        parse_usage_from_sse_data,
+        LogEntry, ProxyState, RequestLogger, SseUsageParser, UsageMetrics, compute_relative_path,
+        emit_usage_event, parse_usage_from_sse_data,
     };
     use crate::{config::AppConfig, usage::UsageEvent};
+    use axum::http::{HeaderMap, StatusCode};
+    use bytes::Bytes;
     use reqwest::Client;
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -1083,6 +1371,82 @@ mod tests {
         assert!(capture.usage.is_none());
     }
 
+    #[tokio::test]
+    async fn request_logger_redacts_sensitive_headers_and_logs_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.jsonl");
+
+        let (handle, logger) = RequestLogger::new(path.clone()).await.unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer secret".parse().unwrap());
+        headers.insert("x-api-key", "supersecret".parse().unwrap());
+        headers.insert("cookie", "sid=123".parse().unwrap());
+        headers.insert("custom", "ok".parse().unwrap());
+
+        logger.log_request(
+            "req-1",
+            &"/v1/test".parse().unwrap(),
+            "POST",
+            &headers,
+            &Bytes::from("hi"),
+        );
+        logger.log_response(
+            "req-1",
+            StatusCode::OK,
+            &headers,
+            Some(&Bytes::from_static(b"\xff\x01")),
+            false,
+        );
+        logger.log_stream_end("req-1", "end");
+
+        drop(logger);
+        handle.shutdown().await;
+
+        let contents = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 3);
+
+        let req: LogEntry = serde_json::from_str(lines[0]).unwrap();
+        match req {
+            LogEntry::Request { headers, body, .. } => {
+                assert!(
+                    headers
+                        .iter()
+                        .any(|h| h.name == "authorization" && h.value == "<redacted>")
+                );
+                assert!(
+                    headers
+                        .iter()
+                        .any(|h| h.name == "x-api-key" && h.value == "<redacted>")
+                );
+                assert!(
+                    headers
+                        .iter()
+                        .any(|h| h.name == "cookie" && h.value == "<redacted>")
+                );
+                assert!(
+                    headers
+                        .iter()
+                        .any(|h| h.name == "custom" && h.value == "ok")
+                );
+                assert_eq!(body.encoding, "utf8");
+                assert_eq!(body.data, "hi");
+            }
+            _ => panic!("expected request entry"),
+        }
+
+        let resp: LogEntry = serde_json::from_str(lines[1]).unwrap();
+        match resp {
+            LogEntry::Response { body, .. } => {
+                let body = body.expect("body present");
+                assert_eq!(body.encoding, "base64");
+                assert_eq!(body.len, 2);
+            }
+            _ => panic!("expected response entry"),
+        }
+    }
+
     fn test_proxy_state(tx: mpsc::Sender<UsageEvent>) -> ProxyState {
         ProxyState {
             config: Arc::new(AppConfig::default()),
@@ -1090,6 +1454,7 @@ mod tests {
             client: Client::builder().build().expect("client"),
             upstream_base: "https://api.openai.com/v1".into(),
             public_base_path: "/v1".into(),
+            request_logger: None,
         }
     }
 }

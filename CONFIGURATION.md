@@ -54,6 +54,7 @@ Environment overrides:
 | `CODEX_USAGE_UPSTREAM_BASE_URL` | `[server].upstream_base_url` |
 | `CODEX_USAGE_LISTEN_ADDR` | `[server].listen_addr` |
 | `CODEX_USAGE_DB_PATH` | `[storage].database_path` |
+| `CODEX_USAGE_LOG_FILE` | Enables request/response body logging to the given file path (JSON lines). **Use for debugging only**: bodies are persisted (UTF-8 or base64), only selected headers are redacted (auth/api-key/cookie), and the bounded log queue may drop entries under load (WARN emitted). |
 
 `CODEX_USAGE_UPSTREAM_BASE_URL` intentionally differs from Codex CLI’s own `OPENAI_BASE_URL`. Set the former to the real upstream (usually `https://api.openai.com/v1`) so you can still point Codex at the proxy via `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` without confusing the proxy about its upstream target.
 

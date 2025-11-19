@@ -367,6 +367,7 @@ dependencies = [
  "anyhow",
  "axum",
  "axum-core",
+ "base64",
  "bytes",
  "chrono",
  "clap",

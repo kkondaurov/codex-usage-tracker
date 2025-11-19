@@ -66,6 +66,9 @@ impl AppConfig {
         if let Ok(db_path) = env::var("CODEX_USAGE_DB_PATH") {
             self.storage.database_path = PathBuf::from(db_path);
         }
+        if let Ok(log_path) = env::var("CODEX_USAGE_LOG_FILE") {
+            self.server.request_log_path = Some(PathBuf::from(log_path));
+        }
     }
 }
 
@@ -77,6 +80,8 @@ pub struct ServerConfig {
     pub public_base_path: String,
     #[serde(default = "default_upstream_base_url")]
     pub upstream_base_url: String,
+    #[serde(default)]
+    pub request_log_path: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -85,6 +90,7 @@ impl Default for ServerConfig {
             listen_addr: default_listen_addr(),
             public_base_path: default_public_base_path(),
             upstream_base_url: default_upstream_base_url(),
+            request_log_path: None,
         }
     }
 }
@@ -390,8 +396,11 @@ mod tests {
         let _lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
         let _listen_guard = EnvGuard::set("CODEX_USAGE_LISTEN_ADDR", "127.0.0.1:7000");
         let _db_guard = EnvGuard::set("CODEX_USAGE_DB_PATH", "/tmp/codex-test.db");
-        let _base_guard =
-            EnvGuard::set("CODEX_USAGE_UPSTREAM_BASE_URL", "https://proxy.example.com/v3");
+        let _base_guard = EnvGuard::set(
+            "CODEX_USAGE_UPSTREAM_BASE_URL",
+            "https://proxy.example.com/v3",
+        );
+        let _log_guard = EnvGuard::set("CODEX_USAGE_LOG_FILE", "/tmp/proxy-log.jsonl");
 
         let file = NamedTempFile::new().unwrap();
         fs::write(
@@ -413,6 +422,10 @@ mod tests {
         assert_eq!(
             config.server.upstream_base_url,
             "https://proxy.example.com/v3"
+        );
+        assert_eq!(
+            config.server.request_log_path,
+            Some(PathBuf::from("/tmp/proxy-log.jsonl"))
         );
     }
 

@@ -54,3 +54,4 @@ Both subsystems communicate through asynchronous channels and share a lightweigh
 - The proxy never stores API keys; it forwards `Authorization` headers verbatim.
 - Request/response bodies are not persisted; only metadata (model, token counts, costs) is stored.
 - Debug logging is opt-in via `RUST_LOG`; production defaults are quiet.
+- Full body logging is opt-in via `CODEX_USAGE_LOG_FILE` (newline-delimited JSON of requests/responses). Headers `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `cookie`, `set-cookie` are redacted; bodies are recorded as UTF-8 or base64. The logger uses a bounded queue; overflow drops entries with a warning. Treat this as a local debugging aid, not production/audit logging.
