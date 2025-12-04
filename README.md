@@ -1,6 +1,10 @@
 # Codex Usage Proxy
 
-`codex-usage-proxy` is a local HTTP proxy for `codex-cli` that forwards every request upstream while recording metered usage in SQLite so you can watch spend in real time in terminal UI.
+When using `codex-cli` with an OpenAI API key, there's no access to usage/spend data.
+
+`codex-usage-proxy` is built to monitor `codex-cli` spend in real time in terminal UI.
+
+Under the hood, it's a local HTTP proxy that forwards every request upstream while recording metered usage in SQLite.
 
 :warning: **HIGHLY EXPERIMENTAL! NO GUARANTEES OF ACCURACY OR STABILITY! USE AT YOUR OWN RISK!**
 
