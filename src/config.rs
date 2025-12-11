@@ -306,6 +306,24 @@ fn default_model_pricing() -> HashMap<String, ModelPricing> {
         },
     );
 
+    models.insert(
+        "gpt-5.2".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00175,
+            cached_prompt_per_1k: Some(0.000175),
+            completion_per_1k: 0.0140,
+        },
+    );
+
+    models.insert(
+        "gpt-5.2-2025-12-11".to_string(),
+        ModelPricing {
+            prompt_per_1k: 0.00175,
+            cached_prompt_per_1k: Some(0.000175),
+            completion_per_1k: 0.0140,
+        },
+    );
+
     models
 }
 
