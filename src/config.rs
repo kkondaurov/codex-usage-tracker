@@ -133,10 +133,10 @@ impl Default for DisplayConfig {
 pub struct PricingConfig {
     #[serde(default = "default_currency")]
     pub currency: String,
-    #[serde(default = "default_prompt_rate")]
-    pub default_prompt_per_1k: f64,
-    #[serde(default = "default_completion_rate")]
-    pub default_completion_per_1k: f64,
+    #[serde(default = "default_prompt_rate", alias = "default_prompt_per_1k")]
+    pub default_prompt_per_1m: f64,
+    #[serde(default = "default_completion_rate", alias = "default_completion_per_1k")]
+    pub default_completion_per_1m: f64,
     #[serde(default = "default_model_pricing")]
     pub models: HashMap<String, ModelPricing>,
 }
@@ -145,55 +145,54 @@ impl Default for PricingConfig {
     fn default() -> Self {
         Self {
             currency: default_currency(),
-            default_prompt_per_1k: default_prompt_rate(),
-            default_completion_per_1k: default_completion_rate(),
+            default_prompt_per_1m: default_prompt_rate(),
+            default_completion_per_1m: default_completion_rate(),
             models: default_model_pricing(),
         }
     }
 }
 
 impl PricingConfig {
-    pub fn price_for_model(&self, model: &str) -> ModelPricing {
-        self.models
-            .get(model)
-            .cloned()
-            .unwrap_or_else(|| ModelPricing {
-                prompt_per_1k: self.default_prompt_per_1k,
-                cached_prompt_per_1k: None,
-                completion_per_1k: self.default_completion_per_1k,
-            })
-    }
-
-    pub fn cost_for(&self, model: &str, prompt_tokens: u64, completion_tokens: u64) -> f64 {
-        self.cost_for_with_cached(model, prompt_tokens, 0, completion_tokens)
-    }
-
-    pub fn cost_for_with_cached(
-        &self,
-        model: &str,
-        prompt_tokens: u64,
-        cached_prompt_tokens: u64,
-        completion_tokens: u64,
-    ) -> f64 {
-        let pricing = self.price_for_model(model);
-        let cached = cached_prompt_tokens.min(prompt_tokens);
-        let uncached = prompt_tokens.saturating_sub(cached);
-        let cached_rate = pricing
-            .cached_prompt_per_1k
-            .unwrap_or(pricing.prompt_per_1k);
-        let prompt_cost = pricing.prompt_per_1k * (uncached as f64 / 1000.0)
-            + cached_rate * (cached as f64 / 1000.0);
-        let completion_cost = pricing.completion_per_1k * (completion_tokens as f64 / 1000.0);
-        prompt_cost + completion_cost
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "ModelPricingInput")]
 pub struct ModelPricing {
-    pub prompt_per_1k: f64,
-    #[serde(default)]
-    pub cached_prompt_per_1k: Option<f64>,
-    pub completion_per_1k: f64,
+    pub prompt_per_1m: f64,
+    pub cached_prompt_per_1m: Option<f64>,
+    pub completion_per_1m: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelPricingInput {
+    prompt_per_1m: Option<f64>,
+    cached_prompt_per_1m: Option<f64>,
+    completion_per_1m: Option<f64>,
+    prompt_per_1k: Option<f64>,
+    cached_prompt_per_1k: Option<f64>,
+    completion_per_1k: Option<f64>,
+}
+
+impl From<ModelPricingInput> for ModelPricing {
+    fn from(input: ModelPricingInput) -> Self {
+        let prompt_per_1m = input
+            .prompt_per_1m
+            .or(input.prompt_per_1k.map(|value| value * 1000.0))
+            .unwrap_or(0.0);
+        let completion_per_1m = input
+            .completion_per_1m
+            .or(input.completion_per_1k.map(|value| value * 1000.0))
+            .unwrap_or(0.0);
+        let cached_prompt_per_1m = input
+            .cached_prompt_per_1m
+            .or(input.cached_prompt_per_1k.map(|value| value * 1000.0));
+
+        Self {
+            prompt_per_1m,
+            cached_prompt_per_1m,
+            completion_per_1m,
+        }
+    }
 }
 
 fn default_listen_addr() -> String {
@@ -229,11 +228,11 @@ fn default_currency() -> String {
 }
 
 fn default_prompt_rate() -> f64 {
-    0.010
+    10.0
 }
 
 fn default_completion_rate() -> f64 {
-    0.030
+    30.0
 }
 
 fn default_model_pricing() -> HashMap<String, ModelPricing> {
@@ -242,85 +241,85 @@ fn default_model_pricing() -> HashMap<String, ModelPricing> {
     models.insert(
         "gpt-4.1".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.0020,
-            cached_prompt_per_1k: Some(0.0005),
-            completion_per_1k: 0.0080,
+            prompt_per_1m: 2.0,
+            cached_prompt_per_1m: Some(0.5),
+            completion_per_1m: 8.0,
         },
     );
     models.insert(
         "gpt-4.1-mini".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00040,
-            cached_prompt_per_1k: Some(0.00010),
-            completion_per_1k: 0.00160,
+            prompt_per_1m: 0.4,
+            cached_prompt_per_1m: Some(0.1),
+            completion_per_1m: 1.6,
         },
     );
     models.insert(
         "gpt-4.1-nano".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00010,
-            cached_prompt_per_1k: Some(0.000025),
-            completion_per_1k: 0.00040,
+            prompt_per_1m: 0.1,
+            cached_prompt_per_1m: Some(0.025),
+            completion_per_1m: 0.4,
         },
     );
     models.insert(
         "gpt-4o-2024-08-06".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00250,
-            cached_prompt_per_1k: Some(0.00125),
-            completion_per_1k: 0.0100,
+            prompt_per_1m: 2.5,
+            cached_prompt_per_1m: Some(1.25),
+            completion_per_1m: 10.0,
         },
     );
     models.insert(
         "gpt-4o-mini-2024-07-18".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00015,
-            cached_prompt_per_1k: Some(0.000075),
-            completion_per_1k: 0.00060,
+            prompt_per_1m: 0.15,
+            cached_prompt_per_1m: Some(0.075),
+            completion_per_1m: 0.6,
         },
     );
     models.insert(
         "o4-mini".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.0040,
-            cached_prompt_per_1k: Some(0.0010),
-            completion_per_1k: 0.0160,
+            prompt_per_1m: 4.0,
+            cached_prompt_per_1m: Some(1.0),
+            completion_per_1m: 16.0,
         },
     );
 
     models.insert(
         "gpt-5.1".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00125,
-            cached_prompt_per_1k: Some(0.000125),
-            completion_per_1k: 0.0100,
+            prompt_per_1m: 1.25,
+            cached_prompt_per_1m: Some(0.125),
+            completion_per_1m: 10.0,
         },
     );
 
     models.insert(
         "gpt-5.1-codex".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00125,
-            cached_prompt_per_1k: Some(0.000125),
-            completion_per_1k: 0.0100,
+            prompt_per_1m: 1.25,
+            cached_prompt_per_1m: Some(0.125),
+            completion_per_1m: 10.0,
         },
     );
 
     models.insert(
         "gpt-5.2".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00175,
-            cached_prompt_per_1k: Some(0.000175),
-            completion_per_1k: 0.0140,
+            prompt_per_1m: 1.75,
+            cached_prompt_per_1m: Some(0.175),
+            completion_per_1m: 14.0,
         },
     );
 
     models.insert(
         "gpt-5.2-2025-12-11".to_string(),
         ModelPricing {
-            prompt_per_1k: 0.00175,
-            cached_prompt_per_1k: Some(0.000175),
-            completion_per_1k: 0.0140,
+            prompt_per_1m: 1.75,
+            cached_prompt_per_1m: Some(0.175),
+            completion_per_1m: 14.0,
         },
     );
 
@@ -336,44 +335,6 @@ mod tests {
         sync::{Mutex, OnceLock},
     };
     use tempfile::NamedTempFile;
-
-    #[test]
-    fn cost_for_known_model_uses_specific_rates() {
-        let config = AppConfig::default();
-        let cost = config.pricing.cost_for("gpt-4.1", 2000, 1000); // 2k prompt, 1k completion
-        let expected = 0.0020 * 2.0 + 0.0080 * 1.0;
-        assert!((cost - expected).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn cost_for_unknown_model_falls_back_to_default() {
-        let mut config = AppConfig::default();
-        config.pricing.default_prompt_per_1k = 0.05;
-        config.pricing.default_completion_per_1k = 0.1;
-        let cost = config.pricing.cost_for("unknown-model", 1000, 1000);
-        assert!((cost - 0.15).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn cost_for_with_cached_tokens_uses_discount_rate() {
-        let mut config = AppConfig::default();
-        config.pricing.default_prompt_per_1k = 0.1;
-        config.pricing.default_completion_per_1k = 0.2;
-        config.pricing.models.insert(
-            "custom".into(),
-            ModelPricing {
-                prompt_per_1k: 0.1,
-                cached_prompt_per_1k: Some(0.01),
-                completion_per_1k: 0.2,
-            },
-        );
-
-        let cost = config
-            .pricing
-            .cost_for_with_cached("custom", 1000, 600, 500);
-        let expected = 0.1 * 0.4 + 0.01 * 0.6 + 0.2 * 0.5;
-        assert!((cost - expected).abs() < 1e-6);
-    }
 
     #[test]
     fn load_from_file_applies_overrides() {
@@ -395,8 +356,8 @@ mod tests {
             recent_events_capacity = 77
 
             [pricing.models.test]
-            prompt_per_1k = 0.001
-            completion_per_1k = 0.003
+            prompt_per_1m = 1.0
+            completion_per_1m = 3.0
         "#;
         fs::write(file.path(), toml).unwrap();
 
@@ -404,9 +365,9 @@ mod tests {
         assert_eq!(config.server.listen_addr, "0.0.0.0:9999");
         assert_eq!(config.storage.database_path, PathBuf::from("custom.db"));
         assert_eq!(config.display.recent_events_capacity, 77);
-
-        let cost = config.pricing.cost_for("test", 1000, 1000);
-        assert!((cost - 0.004).abs() < f64::EPSILON);
+        let pricing = config.pricing.models.get("test").unwrap();
+        assert!((pricing.prompt_per_1m - 1.0).abs() < f64::EPSILON);
+        assert!((pricing.completion_per_1m - 3.0).abs() < f64::EPSILON);
     }
 
     #[test]

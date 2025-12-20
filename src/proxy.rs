@@ -681,13 +681,6 @@ fn emit_usage_event(
         )
     };
 
-    let cost = state.config.pricing.cost_for_with_cached(
-        &model_name,
-        prompt_tokens,
-        cached_prompt_tokens,
-        completion_tokens,
-    );
-
     let event = UsageEvent {
         timestamp: Utc::now(),
         model: model_name,
@@ -699,7 +692,7 @@ fn emit_usage_event(
         completion_tokens,
         total_tokens,
         reasoning_tokens,
-        cost_usd: cost,
+        cost_usd: None,
         usage_included,
     };
 

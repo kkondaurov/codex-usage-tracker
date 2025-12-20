@@ -18,11 +18,10 @@ Both subsystems communicate through asynchronous channels and share a lightweigh
   - Emits a `UsageEvent` via `tokio::mpsc` without logging payload contents.
 
 - **Usage Aggregator (`src/usage/`)**
-  - Consumes events, computes cost using configured model pricing, and produces derived metrics.
+  - Consumes events, persists token usage, and produces derived metrics.
   - Maintains:
-    - A fixed-size in-memory ring buffer of the most recent N requests (default 500) for the TUI table.
     - Per-day per-model counters persisted in SQLite via `sqlx` (table `daily_stats`).
-  - Exposes helper queries for “today / this week / this month / trailing 12 months”.
+  - Exposes helper queries for “today / this week / this month / trailing 12 months”; costs are computed at query time by joining with the `prices` table.
 
 - **Configuration Layer (`src/config/`)**
   - Loads `codex-usage.toml` from the working directory (override via `--config`).
@@ -36,7 +35,8 @@ Both subsystems communicate through asynchronous channels and share a lightweigh
 
 - **Storage (`src/storage/`)**
   - Wraps SQLite (default file `usage.db` beside the binary).
-  - Provides `upsert_daily_stat(event)` and read helpers that aggregate ranges server-side to keep UI fast.
+  - Stores raw usage in `event_log`, daily aggregates in `daily_stats`, and pricing rules in `prices` (model prefix + `effective_from`).
+  - Cost is computed at read time via SQL joins; missing prices surface as `unknown` in the UI.
 
 ## Data Flow
 
@@ -44,14 +44,13 @@ Both subsystems communicate through asynchronous channels and share a lightweigh
 2. The HTTP proxy forwards each request to OpenAI, streaming data both ways.
 3. When the upstream response completes, the proxy parses JSON (skipping bodies for streaming partials) and emits a `UsageEvent`.
 4. The Aggregator:
-   - Looks up pricing, computes USD cost.
-   - Updates in-memory summary structures.
-   - Persists daily totals through SQLite `INSERT ... ON CONFLICT`.
-5. The TUI listens for aggregator updates, refreshes summary cards, and prepends the event to the visible table.
+   - Persists usage metadata in `event_log`.
+   - Updates daily aggregates through SQLite `INSERT ... ON CONFLICT`.
+5. The TUI queries SQLite for live totals and recent events, joining against the `prices` table to compute cost on the fly.
 
 ## Security & Privacy Notes
 
 - The proxy never stores API keys; it forwards `Authorization` headers verbatim.
-- Request/response bodies are not persisted; only metadata (model, token counts, costs) is stored.
+- Request/response bodies are not persisted; only metadata (model, token counts) is stored. Costs are derived at read time.
 - Debug logging is opt-in via `RUST_LOG`; production defaults are quiet.
 - Full body logging is opt-in via `CODEX_USAGE_LOG_FILE` (newline-delimited JSON of requests/responses). Headers `authorization`, `proxy-authorization`, `x-api-key`, `api-key`, `cookie`, `set-cookie` are redacted; bodies are recorded as UTF-8 or base64. The logger uses a bounded queue; overflow drops entries with a warning. Treat this as a local debugging aid, not production/audit logging.

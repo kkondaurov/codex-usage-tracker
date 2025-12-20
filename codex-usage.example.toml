@@ -14,65 +14,65 @@ refresh_hz = 10
 
 [pricing]
 currency = "USD"
-default_prompt_per_1k = 0.00125
-default_completion_per_1k = 0.0100
+# Pricing entries seed the local prices table on first run (effective_from = today).
+# Rates are expressed as USD per 1M tokens.
 
 [pricing.models."gpt-4.1"]
-prompt_per_1k = 0.0020
-cached_prompt_per_1k = 0.0005
-completion_per_1k = 0.0080
+prompt_per_1m = 2.0
+cached_prompt_per_1m = 0.5
+completion_per_1m = 8.0
 
 [pricing.models."gpt-4.1-mini"]
-prompt_per_1k = 0.00040
-cached_prompt_per_1k = 0.00010
-completion_per_1k = 0.00160
+prompt_per_1m = 0.4
+cached_prompt_per_1m = 0.1
+completion_per_1m = 1.6
 
 [pricing.models."gpt-4.1-nano"]
-prompt_per_1k = 0.00010
-cached_prompt_per_1k = 0.000025
-completion_per_1k = 0.00040
+prompt_per_1m = 0.1
+cached_prompt_per_1m = 0.025
+completion_per_1m = 0.4
 
 [pricing.models."gpt-4o-2024-08-06"]
-prompt_per_1k = 0.00250
-cached_prompt_per_1k = 0.00125
-completion_per_1k = 0.0100
+prompt_per_1m = 2.5
+cached_prompt_per_1m = 1.25
+completion_per_1m = 10.0
 
 [pricing.models."gpt-4o-mini-2024-07-18"]
-prompt_per_1k = 0.00015
-cached_prompt_per_1k = 0.000075
-completion_per_1k = 0.00060
+prompt_per_1m = 0.15
+cached_prompt_per_1m = 0.075
+completion_per_1m = 0.6
 
 [pricing.models."o4-mini"]
-prompt_per_1k = 0.0040
-cached_prompt_per_1k = 0.0010
-completion_per_1k = 0.0160
+prompt_per_1m = 4.0
+cached_prompt_per_1m = 1.0
+completion_per_1m = 16.0
 
 [pricing.models."gpt-5"]
-prompt_per_1k = 0.00125
-cached_prompt_per_1k = 0.000125
-completion_per_1k = 0.0100
+prompt_per_1m = 1.25
+cached_prompt_per_1m = 0.125
+completion_per_1m = 10.0
 
 [pricing.models."gpt-5-codex"]
-prompt_per_1k = 0.00125
-cached_prompt_per_1k = 0.000125
-completion_per_1k = 0.0100
+prompt_per_1m = 1.25
+cached_prompt_per_1m = 0.125
+completion_per_1m = 10.0
 
 [pricing.models."gpt-5.1-2025-11-13"]
-prompt_per_1k = 0.00125
-cached_prompt_per_1k = 0.000125
-completion_per_1k = 0.0100
+prompt_per_1m = 1.25
+cached_prompt_per_1m = 0.125
+completion_per_1m = 10.0
 
 [pricing.models."gpt-5.1-codex"]
-prompt_per_1k = 0.00125
-cached_prompt_per_1k = 0.000125
-completion_per_1k = 0.0100
+prompt_per_1m = 1.25
+cached_prompt_per_1m = 0.125
+completion_per_1m = 10.0
 
 [pricing.models."gpt-5.2"]
-prompt_per_1k = 0.00175
-cached_prompt_per_1k = 0.000175
-completion_per_1k = 0.0140
+prompt_per_1m = 1.75
+cached_prompt_per_1m = 0.175
+completion_per_1m = 14.0
 
 [pricing.models."gpt-5.2-2025-12-11"]
-prompt_per_1k = 0.00175
-cached_prompt_per_1k = 0.000175
-completion_per_1k = 0.0140
+prompt_per_1m = 1.75
+cached_prompt_per_1m = 0.175
+completion_per_1m = 14.0

@@ -1,14 +1,17 @@
 use crate::{
     config::AppConfig,
-    storage::{AggregateTotals, ConversationAggregate, ConversationTurn, Storage},
-    usage::{RecentEvents, UsageEvent},
+    storage::{
+        AggregateTotals, ConversationAggregate, ConversationTurn, MissingPriceRow, NewPrice,
+        PriceRow, Storage,
+    },
+    usage::UsageEvent,
 };
 use anyhow::{Context, Result};
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Months, NaiveDate, TimeZone, Timelike, Utc,
 };
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -18,13 +21,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, Wrap},
 };
 use std::{
     collections::HashMap,
     io::{self, Stdout},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::Handle;
 
@@ -41,6 +44,7 @@ enum ViewMode {
     Overview,
     Conversations,
     Stats,
+    Pricing,
 }
 
 impl ViewMode {
@@ -48,7 +52,8 @@ impl ViewMode {
         match self {
             ViewMode::Overview => ViewMode::Conversations,
             ViewMode::Conversations => ViewMode::Stats,
-            ViewMode::Stats => ViewMode::Overview,
+            ViewMode::Stats => ViewMode::Pricing,
+            ViewMode::Pricing => ViewMode::Overview,
         }
     }
 }
@@ -56,14 +61,13 @@ impl ViewMode {
 pub async fn run(
     config: Arc<AppConfig>,
     storage: Storage,
-    recent_events: RecentEvents,
 ) -> Result<()> {
     let refresh_hz = config.display.refresh_hz.max(1);
     let tick_rate = Duration::from_millis(1000 / refresh_hz);
     let runtime = Handle::current();
 
     tokio::task::spawn_blocking(move || {
-        run_blocking(runtime, config, storage, recent_events, tick_rate)
+        run_blocking(runtime, config, storage, tick_rate)
     })
     .await?
 }
@@ -72,18 +76,23 @@ fn run_blocking(
     runtime: Handle,
     config: Arc<AppConfig>,
     storage: Storage,
-    recent_events: RecentEvents,
     tick_rate: Duration,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
     let mut conversation_view = ConversationViewState::new();
     let mut stats_view = StatsViewState::new();
+    let mut pricing_view = PricingViewState::new();
     let mut view_mode = ViewMode::Overview;
 
     let loop_result: Result<()> = (|| -> Result<()> {
         loop {
             let today = Utc::now().date_naive();
-            let recent = recent_events.snapshot(Some(config.display.recent_events_capacity));
+            let recent = runtime
+                .block_on(storage.recent_events(config.display.recent_events_capacity))
+                .unwrap_or_else(|err| {
+                    tracing::warn!(error = %err, "failed to load recent events");
+                    Vec::new()
+                });
             let stats = runtime
                 .block_on(SummaryStats::gather(&storage, today))
                 .context("failed to gather summary stats")?;
@@ -126,7 +135,24 @@ fn run_blocking(
             } else {
                 None
             };
+            let (pricing_rows, pricing_missing) = if matches!(view_mode, ViewMode::Pricing) {
+                let rows = runtime.block_on(storage.list_prices()).unwrap_or_else(|err| {
+                    tracing::warn!(error = %err, "failed to load price list");
+                    Vec::new()
+                });
+                let missing = runtime
+                    .block_on(storage.missing_price_models(6))
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(error = %err, "failed to load missing price models");
+                        Vec::new()
+                    });
+                pricing_view.sync(rows.len());
+                (Some(rows), Some(missing))
+            } else {
+                (None, None)
+            };
 
+            let show_cursor = should_show_cursor();
             terminal.draw(|frame| {
                 draw_ui(
                     frame,
@@ -136,9 +162,13 @@ fn run_blocking(
                     &conversation_stats,
                     &conversation_view,
                     &stats_view,
+                    &pricing_view,
                     selected_conversation.as_ref(),
                     &conversation_turns,
                     stats_breakdown.as_ref(),
+                    pricing_rows.as_deref(),
+                    pricing_missing.as_deref(),
+                    show_cursor,
                     view_mode,
                 );
             })?;
@@ -152,6 +182,19 @@ fn run_blocking(
                         break Ok(());
                     }
 
+                    if handle_pricing_input(
+                        view_mode,
+                        &mut pricing_view,
+                        pricing_rows.as_deref().unwrap_or(&[]),
+                        key,
+                        &runtime,
+                        &storage,
+                        today,
+                        &config.pricing.currency,
+                    ) {
+                        continue;
+                    }
+
                     match key.code {
                         KeyCode::Char('1') => {
                             view_mode = ViewMode::Overview;
@@ -161,6 +204,9 @@ fn run_blocking(
                         }
                         KeyCode::Char('3') => {
                             view_mode = ViewMode::Stats;
+                        }
+                        KeyCode::Char('4') => {
+                            view_mode = ViewMode::Pricing;
                         }
                         KeyCode::Tab => {
                             view_mode = view_mode.next();
@@ -238,9 +284,13 @@ fn draw_ui(
     conversations: &ConversationStats,
     conversation_view: &ConversationViewState,
     stats_view: &StatsViewState,
+    pricing_view: &PricingViewState,
     selected: Option<&ConversationAggregate>,
     turns: &[ConversationTurn],
     stats_breakdown: Option<&StatsBreakdown>,
+    pricing_rows: Option<&[PriceRow]>,
+    pricing_missing: Option<&[MissingPriceRow]>,
+    show_cursor: bool,
     view_mode: ViewMode,
 ) {
     let layout = Layout::default()
@@ -260,6 +310,19 @@ fn draw_ui(
             turns,
         ),
         ViewMode::Stats => draw_stats_view(frame, layout[1], stats_breakdown, stats_view),
+        ViewMode::Pricing => draw_pricing_view(
+            frame,
+            layout[1],
+            pricing_rows.unwrap_or(&[]),
+            pricing_missing.unwrap_or(&[]),
+            pricing_view,
+        ),
+    }
+
+    if let ViewMode::Pricing = view_mode {
+        if let Some(modal) = &pricing_view.modal {
+            render_pricing_modal(frame, modal, show_cursor);
+        }
     }
 }
 
@@ -358,11 +421,246 @@ fn draw_stats_view(
     }
 }
 
+fn draw_pricing_view(
+    frame: &mut Frame,
+    area: Rect,
+    prices: &[PriceRow],
+    missing: &[MissingPriceRow],
+    view: &PricingViewState,
+) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
+        .split(area);
+
+    render_missing_prices(frame, layout[0], missing);
+
+    let header = light_blue_header(vec![
+        "Model Prefix",
+        "Effective From",
+        "Currency",
+        "Prompt /1M",
+        "Cached /1M",
+        "Completion /1M",
+    ]);
+
+    let rows: Vec<Row> = if prices.is_empty() {
+        vec![Row::new(vec![
+            "No prices configured",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ])]
+    } else {
+        prices
+            .iter()
+            .enumerate()
+            .map(|(idx, price)| {
+                let mut row = Row::new(vec![
+                    truncate_text(&price.model, 24),
+                    price.effective_from.to_string(),
+                    truncate_text(&price.currency, 6),
+                    format_rate(price.prompt_per_1m),
+                    price
+                        .cached_prompt_per_1m
+                        .map(format_rate)
+                        .unwrap_or_else(|| "—".to_string()),
+                    format_rate(price.completion_per_1m),
+                ]);
+                if idx == view.selected_row {
+                    row = row.style(
+                        Style::default()
+                            .fg(Color::White)
+                            .bg(Color::Blue)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                }
+                row
+            })
+            .collect()
+    };
+
+    let widths = [
+        Constraint::Length(26),
+        Constraint::Length(14),
+        Constraint::Length(10),
+        Constraint::Length(14),
+        Constraint::Length(14),
+        Constraint::Length(14),
+    ];
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(gray_block(
+            "Pricing (a=add, Enter=edit, d=delete; ↑/↓ or j/k to move)",
+        ))
+        .column_spacing(1);
+
+    frame.render_widget(table, layout[1]);
+}
+
+fn render_pricing_modal(frame: &mut Frame, modal: &PricingModal, show_cursor: bool) {
+    let area = centered_rect(70, 60, frame.size());
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(Color::Black))
+        .title(match modal {
+            PricingModal::Create(_) => "Create Price",
+            PricingModal::Update { .. } => "Update Price",
+            PricingModal::DeleteConfirm { .. } => "Delete Price",
+        });
+
+    match modal {
+        PricingModal::Create(form) => render_price_form(frame, area, block, form, show_cursor),
+        PricingModal::Update { form, .. } => render_price_form(frame, area, block, form, show_cursor),
+        PricingModal::DeleteConfirm { label, error, .. } => {
+            let mut lines = vec![
+                Line::from(format!("Delete price for {label}?")),
+                Line::from("Press y to confirm, n or Esc to cancel."),
+            ];
+            if let Some(message) = error.as_ref() {
+                lines.push(Line::from(Span::styled(
+                    message.clone(),
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )));
+            }
+            let paragraph = Paragraph::new(lines).block(block);
+            frame.render_widget(paragraph, area);
+        }
+    }
+}
+
+fn render_missing_prices(frame: &mut Frame, area: Rect, missing: &[MissingPriceRow]) {
+    let block = gray_block("Missing Prices (add or adjust effective_from)");
+    if missing.is_empty() {
+        let paragraph = Paragraph::new("No missing prices detected.").block(block);
+        frame.render_widget(paragraph, area);
+        return;
+    }
+
+    let mut parts = Vec::new();
+    for entry in missing.iter() {
+        let model = truncate_text(&entry.model, 24);
+        let last_seen = entry.last_seen.format("%Y-%m-%d").to_string();
+        parts.push(format!(
+            "{model} ×{} (last {last_seen})",
+            entry.missing_count
+        ));
+    }
+    let text = format!("Missing prices for: {}", parts.join(" • "));
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: true }).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_price_form(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    form: &PricingFormState,
+    show_cursor: bool,
+) {
+    let fields = [
+        (PricingField::Model, "Model prefix", &form.model),
+        (
+            PricingField::EffectiveFrom,
+            "Effective from (YYYY-MM-DD)",
+            &form.effective_from,
+        ),
+        (PricingField::Currency, "Currency", &form.currency),
+        (PricingField::Prompt, "Prompt /1M", &form.prompt_per_1m),
+        (PricingField::Cached, "Cached /1M (optional)", &form.cached_prompt_per_1m),
+        (
+            PricingField::Completion,
+            "Completion /1M",
+            &form.completion_per_1m,
+        ),
+    ];
+
+    let mut lines = Vec::with_capacity(fields.len() + 2);
+    for (field, label, value) in fields.iter() {
+        let active = *field == form.active_field;
+        let value_style = if active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let display_value = if active && show_cursor {
+            let trimmed = value.as_str();
+            if trimmed.is_empty() {
+                "█".to_string()
+            } else {
+                format!("{trimmed}█")
+            }
+        } else if active && value.is_empty() {
+            " ".to_string()
+        } else {
+            (*value).clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(Color::Gray)),
+            Span::styled(display_value, value_style),
+        ]));
+    }
+
+    if let Some(message) = form.error.as_ref() {
+        lines.push(Line::from(Span::styled(
+            message.clone(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Tab/Shift+Tab to move • Enter to save • Esc to cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
+    frame.render_widget(paragraph, area);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+fn format_rate(value: f64) -> String {
+    format!("{:.4}", value)
+}
+
+fn should_show_cursor() -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    (now / 500) % 2 == 0
+}
+
 fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode) {
     let tabs = [
         (ViewMode::Overview, "1 Overview"),
         (ViewMode::Conversations, "2 Conversations"),
         (ViewMode::Stats, "3 Stats"),
+        (ViewMode::Pricing, "4 Pricing"),
     ];
     let mut spans = Vec::new();
     for (idx, (mode, label)) in tabs.iter().enumerate() {
@@ -382,7 +680,8 @@ fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode) {
         }
     }
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).block(gray_block("Tabs (1/2/3, Tab to cycle, 'q' quits)"));
+    let paragraph =
+        Paragraph::new(line).block(gray_block("Tabs (1/2/3/4, Tab to cycle, 'q' quits)"));
     frame.render_widget(paragraph, area);
 }
 
@@ -720,8 +1019,11 @@ fn format_tokens(value: u64) -> String {
     }
 }
 
-fn format_cost(cost: f64) -> String {
-    format!("${:.4}", cost)
+fn format_cost(cost: Option<f64>) -> String {
+    match cost {
+        Some(value) => format!("${:.4}", value),
+        None => "unknown".to_string(),
+    }
 }
 
 fn format_usage_tokens(event: &UsageEvent, value: u64) -> String {
@@ -748,11 +1050,169 @@ fn format_turn_tokens(included: bool, value: u64) -> String {
     }
 }
 
-fn format_turn_cost(included: bool, cost: f64) -> String {
+fn format_turn_cost(included: bool, cost: Option<f64>) -> String {
     if included {
         format_cost(cost)
     } else {
         "n/a".to_string()
+    }
+}
+
+fn handle_pricing_input(
+    view_mode: ViewMode,
+    pricing_view: &mut PricingViewState,
+    prices: &[PriceRow],
+    key: KeyEvent,
+    runtime: &Handle,
+    storage: &Storage,
+    today: NaiveDate,
+    default_currency: &str,
+) -> bool {
+    if !matches!(view_mode, ViewMode::Pricing) {
+        return false;
+    }
+
+    if let Some(modal) = pricing_view.modal.as_mut() {
+        let close = handle_pricing_modal_input(modal, key, runtime, storage);
+        if close {
+            pricing_view.modal = None;
+        }
+        return true;
+    }
+
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            pricing_view.move_selection_up(prices.len());
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            pricing_view.move_selection_down(prices.len());
+            true
+        }
+        KeyCode::Char('a') | KeyCode::Char('A')
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            pricing_view.modal = Some(PricingModal::Create(PricingFormState::new(
+                today,
+                default_currency,
+            )));
+            true
+        }
+        KeyCode::Enter => {
+            if prices.is_empty() {
+                pricing_view.modal = Some(PricingModal::Create(PricingFormState::new(
+                    today,
+                    default_currency,
+                )));
+            } else if let Some(row) = pricing_view.selected(prices) {
+                pricing_view.modal = Some(PricingModal::Update {
+                    id: row.id,
+                    form: PricingFormState::from_row(row),
+                });
+            }
+            true
+        }
+        KeyCode::Char('d') | KeyCode::Char('D')
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            if let Some(row) = pricing_view.selected(prices) {
+                pricing_view.modal = Some(PricingModal::DeleteConfirm {
+                    id: row.id,
+                    label: format!("{} @ {}", row.model, row.effective_from),
+                    error: None,
+                });
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_pricing_modal_input(
+    modal: &mut PricingModal,
+    key: KeyEvent,
+    runtime: &Handle,
+    storage: &Storage,
+) -> bool {
+    match modal {
+        PricingModal::Create(form) => handle_pricing_form_input(form, None, key, runtime, storage),
+        PricingModal::Update { id, form } => {
+            handle_pricing_form_input(form, Some(*id), key, runtime, storage)
+        }
+        PricingModal::DeleteConfirm { id, error, .. } => match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                if let Err(err) = runtime.block_on(storage.delete_price(*id)) {
+                    *error = Some(err.to_string());
+                    return false;
+                }
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Esc => true,
+            _ => false,
+        },
+    }
+}
+
+fn handle_pricing_form_input(
+    form: &mut PricingFormState,
+    id: Option<i64>,
+    key: KeyEvent,
+    runtime: &Handle,
+    storage: &Storage,
+) -> bool {
+    match key.code {
+        KeyCode::Esc => true,
+        KeyCode::Tab => {
+            form.active_field = form.active_field.next();
+            false
+        }
+        KeyCode::BackTab => {
+            form.active_field = form.active_field.prev();
+            false
+        }
+        KeyCode::Up => {
+            form.active_field = form.active_field.prev();
+            false
+        }
+        KeyCode::Down => {
+            form.active_field = form.active_field.next();
+            false
+        }
+        KeyCode::Backspace => {
+            let value = form.active_value_mut();
+            value.pop();
+            form.error = None;
+            false
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            let value = form.active_value_mut();
+            value.push(ch);
+            form.error = None;
+            false
+        }
+        KeyCode::Enter => {
+            match form.parse() {
+                Ok(price) => {
+                    let result = if let Some(row_id) = id {
+                        runtime.block_on(storage.update_price(row_id, &price))
+                    } else {
+                        runtime.block_on(storage.insert_price(&price)).map(|_| ())
+                    };
+                    if let Err(err) = result {
+                        form.error = Some(err.to_string());
+                        return false;
+                    }
+                    true
+                }
+                Err(message) => {
+                    form.error = Some(message);
+                    false
+                }
+            }
+        }
+        _ => false,
     }
 }
 
@@ -1096,6 +1556,187 @@ impl StatsViewState {
             return;
         }
         self.active_period = (self.active_period + 1) % self.periods_len;
+    }
+}
+
+struct PricingViewState {
+    selected_row: usize,
+    modal: Option<PricingModal>,
+}
+
+impl PricingViewState {
+    fn new() -> Self {
+        Self {
+            selected_row: 0,
+            modal: None,
+        }
+    }
+
+    fn sync(&mut self, rows: usize) {
+        if rows == 0 {
+            self.selected_row = 0;
+        } else if self.selected_row >= rows {
+            self.selected_row = rows - 1;
+        }
+    }
+
+    fn move_selection_up(&mut self, rows: usize) {
+        if rows == 0 {
+            self.selected_row = 0;
+            return;
+        }
+        if self.selected_row > 0 {
+            self.selected_row -= 1;
+        }
+    }
+
+    fn move_selection_down(&mut self, rows: usize) {
+        if rows == 0 {
+            self.selected_row = 0;
+            return;
+        }
+        if self.selected_row + 1 < rows {
+            self.selected_row += 1;
+        }
+    }
+
+    fn selected<'a>(&self, prices: &'a [PriceRow]) -> Option<&'a PriceRow> {
+        prices.get(self.selected_row)
+    }
+}
+
+enum PricingModal {
+    Create(PricingFormState),
+    Update { id: i64, form: PricingFormState },
+    DeleteConfirm { id: i64, label: String, error: Option<String> },
+}
+
+struct PricingFormState {
+    model: String,
+    effective_from: String,
+    currency: String,
+    prompt_per_1m: String,
+    cached_prompt_per_1m: String,
+    completion_per_1m: String,
+    active_field: PricingField,
+    error: Option<String>,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum PricingField {
+    Model,
+    EffectiveFrom,
+    Currency,
+    Prompt,
+    Cached,
+    Completion,
+}
+
+impl PricingField {
+    fn next(self) -> Self {
+        match self {
+            PricingField::Model => PricingField::EffectiveFrom,
+            PricingField::EffectiveFrom => PricingField::Currency,
+            PricingField::Currency => PricingField::Prompt,
+            PricingField::Prompt => PricingField::Cached,
+            PricingField::Cached => PricingField::Completion,
+            PricingField::Completion => PricingField::Model,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            PricingField::Model => PricingField::Completion,
+            PricingField::EffectiveFrom => PricingField::Model,
+            PricingField::Currency => PricingField::EffectiveFrom,
+            PricingField::Prompt => PricingField::Currency,
+            PricingField::Cached => PricingField::Prompt,
+            PricingField::Completion => PricingField::Cached,
+        }
+    }
+}
+
+impl PricingFormState {
+    fn new(today: NaiveDate, currency: &str) -> Self {
+        Self {
+            model: String::new(),
+            effective_from: today.to_string(),
+            currency: currency.to_string(),
+            prompt_per_1m: String::new(),
+            cached_prompt_per_1m: String::new(),
+            completion_per_1m: String::new(),
+            active_field: PricingField::Model,
+            error: None,
+        }
+    }
+
+    fn from_row(row: &PriceRow) -> Self {
+        Self {
+            model: row.model.clone(),
+            effective_from: row.effective_from.to_string(),
+            currency: row.currency.clone(),
+            prompt_per_1m: format!("{:.4}", row.prompt_per_1m),
+            cached_prompt_per_1m: row
+                .cached_prompt_per_1m
+                .map(|value| format!("{:.4}", value))
+                .unwrap_or_default(),
+            completion_per_1m: format!("{:.4}", row.completion_per_1m),
+            active_field: PricingField::Model,
+            error: None,
+        }
+    }
+
+    fn active_value_mut(&mut self) -> &mut String {
+        match self.active_field {
+            PricingField::Model => &mut self.model,
+            PricingField::EffectiveFrom => &mut self.effective_from,
+            PricingField::Currency => &mut self.currency,
+            PricingField::Prompt => &mut self.prompt_per_1m,
+            PricingField::Cached => &mut self.cached_prompt_per_1m,
+            PricingField::Completion => &mut self.completion_per_1m,
+        }
+    }
+
+    fn parse(&self) -> Result<NewPrice, String> {
+        let model = self.model.trim().to_string();
+        if model.is_empty() {
+            return Err("Model is required.".to_string());
+        }
+        let currency = self.currency.trim().to_string();
+        if currency.is_empty() {
+            return Err("Currency is required.".to_string());
+        }
+        let effective_from = NaiveDate::parse_from_str(self.effective_from.trim(), "%Y-%m-%d")
+            .map_err(|_| "Effective date must be YYYY-MM-DD.".to_string())?;
+        let prompt_per_1m = self
+            .prompt_per_1m
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| "Prompt rate must be a number.".to_string())?;
+        let completion_per_1m = self
+            .completion_per_1m
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| "Completion rate must be a number.".to_string())?;
+        let cached_trim = self.cached_prompt_per_1m.trim();
+        let cached_prompt_per_1m = if cached_trim.is_empty() {
+            None
+        } else {
+            Some(
+                cached_trim
+                    .parse::<f64>()
+                    .map_err(|_| "Cached prompt rate must be a number.".to_string())?,
+            )
+        };
+
+        Ok(NewPrice {
+            model,
+            effective_from,
+            currency,
+            prompt_per_1m,
+            cached_prompt_per_1m,
+            completion_per_1m,
+        })
     }
 }
 

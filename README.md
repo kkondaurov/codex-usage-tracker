@@ -57,3 +57,5 @@ Run `codex` via the proxy:
 ```
 OPENAI_BASE_URL="http://127.0.0.1:8787/v1" codex
 ```
+
+Pricing is seeded from `codex-usage.toml` on first run (effective_from = today). Use the Pricing tab (`4`) in the TUI to add/update prices and backfill historical effective dates.
