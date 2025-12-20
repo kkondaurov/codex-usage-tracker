@@ -1,4 +1,9 @@
-use crate::{config::AppConfig, proxy, storage::{NewPrice, Storage}, tui, usage};
+use crate::{
+    config::AppConfig,
+    proxy,
+    storage::{NewPrice, Storage},
+    tui, usage,
+};
 use anyhow::Result;
 use chrono::Utc;
 use std::sync::Arc;

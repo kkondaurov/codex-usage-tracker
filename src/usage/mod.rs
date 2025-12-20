@@ -15,11 +15,13 @@ pub struct UsageEvent {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub reasoning_tokens: u64,
+    #[allow(dead_code)]
     pub cost_usd: Option<f64>,
     pub usage_included: bool,
 }
 
 impl UsageEvent {
+    #[allow(dead_code)]
     pub fn blended_total(&self) -> u64 {
         blended_total(
             self.prompt_tokens,

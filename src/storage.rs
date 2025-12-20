@@ -364,7 +364,9 @@ impl Storage {
     async fn ensure_prices_schema(&self) -> Result<()> {
         let legacy_prompt = self.table_has_column("prices", "prompt_per_1k").await?;
         let legacy_completion = self.table_has_column("prices", "completion_per_1k").await?;
-        let legacy_cached = self.table_has_column("prices", "cached_prompt_per_1k").await?;
+        let legacy_cached = self
+            .table_has_column("prices", "cached_prompt_per_1k")
+            .await?;
         let needs_reset = legacy_prompt || legacy_completion || legacy_cached;
 
         if needs_reset {
@@ -798,6 +800,136 @@ impl Storage {
         })
     }
 
+    pub async fn recent_conversations(&self) -> Result<Vec<ConversationAggregate>> {
+        let rows = sqlx::query(
+            r#"
+            WITH all_events AS (
+                SELECT
+                    COALESCE(conversation_id, '__unlabeled__') AS conv_key,
+                    conversation_id,
+                    timestamp,
+                    model,
+                    title,
+                    summary,
+                    prompt_tokens,
+                    cached_prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                    reasoning_tokens,
+                    cost_usd,
+                    missing_price
+                FROM event_costs
+            ),
+            aggregates AS (
+                SELECT
+                    conv_key,
+                    MAX(conversation_id) AS conversation_id,
+                    SUM(prompt_tokens) AS prompt_tokens,
+                    SUM(cached_prompt_tokens) AS cached_prompt_tokens,
+                    SUM(completion_tokens) AS completion_tokens,
+                    SUM(total_tokens) AS total_tokens,
+                    SUM(reasoning_tokens) AS reasoning_tokens,
+                    COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+                    COALESCE(SUM(missing_price), 0) AS missing_price,
+                    MAX(timestamp) AS last_activity
+                FROM all_events
+                GROUP BY conv_key
+            ),
+            first_prompts AS (
+                SELECT conv_key, title AS first_title
+                FROM (
+                    SELECT
+                        conv_key,
+                        title,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY conv_key
+                            ORDER BY timestamp ASC
+                        ) AS rn
+                    FROM all_events
+                    WHERE title IS NOT NULL AND LENGTH(TRIM(title)) > 0
+                )
+                WHERE rn = 1
+            ),
+            last_summaries AS (
+                SELECT conv_key, summary AS last_summary
+                FROM (
+                    SELECT
+                        conv_key,
+                        summary,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY conv_key
+                            ORDER BY timestamp DESC
+                        ) AS rn
+                    FROM all_events
+                    WHERE summary IS NOT NULL AND LENGTH(TRIM(summary)) > 0
+                )
+                WHERE rn = 1
+            ),
+            last_models AS (
+                SELECT conv_key, model AS last_model
+                FROM (
+                    SELECT
+                        conv_key,
+                        model,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY conv_key
+                            ORDER BY timestamp DESC
+                        ) AS rn
+                    FROM all_events
+                )
+                WHERE rn = 1
+            )
+            SELECT
+                aggregates.conversation_id,
+                aggregates.last_activity,
+                last_models.last_model,
+                aggregates.prompt_tokens,
+                aggregates.cached_prompt_tokens,
+                aggregates.completion_tokens,
+                aggregates.total_tokens,
+                aggregates.reasoning_tokens,
+                aggregates.cost_usd,
+                aggregates.missing_price,
+                first_prompts.first_title,
+                last_summaries.last_summary
+            FROM aggregates
+            LEFT JOIN first_prompts ON first_prompts.conv_key = aggregates.conv_key
+            LEFT JOIN last_summaries ON last_summaries.conv_key = aggregates.conv_key
+            LEFT JOIN last_models ON last_models.conv_key = aggregates.conv_key
+            ORDER BY aggregates.last_activity DESC
+            "#,
+        )
+        .fetch_all(&*self.pool)
+        .await
+        .with_context(|| "failed to load recent conversations")?;
+
+        let mut aggregates = Vec::with_capacity(rows.len());
+        for row in rows {
+            let last_activity_str: String = row.try_get("last_activity")?;
+            let last_activity = DateTime::parse_from_rfc3339(&last_activity_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .with_context(|| "invalid last_activity timestamp in aggregates")?;
+            aggregates.push(ConversationAggregate {
+                conversation_id: row.try_get::<Option<String>, _>("conversation_id")?,
+                last_activity,
+                last_model: row
+                    .try_get::<String, _>("last_model")
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
+                    as u64,
+                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                cost_usd: cost_from_row(&row),
+                first_title: row.try_get::<Option<String>, _>("first_title")?,
+                last_summary: row.try_get::<Option<String>, _>("last_summary")?,
+            });
+        }
+
+        Ok(aggregates)
+    }
+
     pub async fn top_conversations_between(
         &self,
         start: DateTime<Utc>,
@@ -812,6 +944,7 @@ impl Storage {
                     COALESCE(conversation_id, '__unlabeled__') AS conv_key,
                     conversation_id,
                     timestamp,
+                    model,
                     title,
                     summary,
                     prompt_tokens,
@@ -851,7 +984,8 @@ impl Storage {
                     SUM(total_tokens) AS total_tokens,
                     SUM(reasoning_tokens) AS reasoning_tokens,
                     COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
-                    COALESCE(SUM(missing_price), 0) AS missing_price
+                    COALESCE(SUM(missing_price), 0) AS missing_price,
+                    MAX(timestamp) AS last_activity
                 FROM all_events
                 GROUP BY conv_key
             ),
@@ -884,9 +1018,25 @@ impl Storage {
                     WHERE summary IS NOT NULL AND LENGTH(TRIM(summary)) > 0
                 )
                 WHERE rn = 1
+            ),
+            last_models AS (
+                SELECT conv_key, model AS last_model
+                FROM (
+                    SELECT
+                        conv_key,
+                        model,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY conv_key
+                            ORDER BY timestamp DESC
+                        ) AS rn
+                    FROM all_events
+                )
+                WHERE rn = 1
             )
             SELECT
                 aggregates.conversation_id,
+                aggregates.last_activity,
+                last_models.last_model,
                 aggregates.prompt_tokens,
                 aggregates.cached_prompt_tokens,
                 aggregates.completion_tokens,
@@ -901,6 +1051,7 @@ impl Storage {
             LEFT JOIN period_stats ON period_stats.conv_key = aggregates.conv_key
             LEFT JOIN first_prompts ON first_prompts.conv_key = aggregates.conv_key
             LEFT JOIN last_summaries ON last_summaries.conv_key = aggregates.conv_key
+            LEFT JOIN last_models ON last_models.conv_key = aggregates.conv_key
             ORDER BY COALESCE(period_stats.period_cost, 0) DESC,
                      COALESCE(period_stats.period_prompt, 0) DESC
             LIMIT ?4
@@ -916,19 +1067,27 @@ impl Storage {
 
         let mut aggregates = Vec::with_capacity(rows.len());
         for row in rows {
-                aggregates.push(ConversationAggregate {
-                    conversation_id: row.try_get::<Option<String>, _>("conversation_id")?,
-                    prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
-                    cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
-                        as u64,
-                    completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
-                    total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-                    reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
-                    cost_usd: cost_from_row(&row),
-                    first_title: row.try_get::<Option<String>, _>("first_title")?,
-                    last_summary: row.try_get::<Option<String>, _>("last_summary")?,
-                });
-            }
+            let last_activity_str: String = row.try_get("last_activity")?;
+            let last_activity = DateTime::parse_from_rfc3339(&last_activity_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .with_context(|| "invalid last_activity timestamp in aggregates")?;
+            aggregates.push(ConversationAggregate {
+                conversation_id: row.try_get::<Option<String>, _>("conversation_id")?,
+                last_activity,
+                last_model: row
+                    .try_get::<String, _>("last_model")
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
+                    as u64,
+                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                cost_usd: cost_from_row(&row),
+                first_title: row.try_get::<Option<String>, _>("first_title")?,
+                last_summary: row.try_get::<Option<String>, _>("last_summary")?,
+            });
+        }
 
         Ok(aggregates)
     }
@@ -943,36 +1102,128 @@ impl Storage {
         let sql = match conversation_id {
             Some(_) => {
                 r#"
+                WITH filtered AS (
+                    SELECT
+                        COALESCE(conversation_id, '__unlabeled__') AS conv_key,
+                        conversation_id,
+                        timestamp,
+                        model,
+                        prompt_tokens,
+                        cached_prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        reasoning_tokens,
+                        cost_usd,
+                        missing_price
+                    FROM event_costs
+                    WHERE timestamp BETWEEN ? AND ?
+                      AND conversation_id = ?
+                ),
+                aggregates AS (
+                    SELECT
+                        conv_key,
+                        MAX(conversation_id) AS conversation_id,
+                        SUM(prompt_tokens) AS prompt_tokens,
+                        SUM(cached_prompt_tokens) AS cached_prompt_tokens,
+                        SUM(completion_tokens) AS completion_tokens,
+                        SUM(total_tokens) AS total_tokens,
+                        SUM(reasoning_tokens) AS reasoning_tokens,
+                        COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+                        COALESCE(SUM(missing_price), 0) AS missing_price,
+                        MAX(timestamp) AS last_activity
+                    FROM filtered
+                    GROUP BY conv_key
+                ),
+                last_models AS (
+                    SELECT conv_key, model AS last_model
+                    FROM (
+                        SELECT
+                            conv_key,
+                            model,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY conv_key
+                                ORDER BY timestamp DESC
+                            ) AS rn
+                        FROM filtered
+                    )
+                    WHERE rn = 1
+                )
                 SELECT
-                    conversation_id,
-                    SUM(prompt_tokens) AS prompt_tokens,
-                    SUM(cached_prompt_tokens) AS cached_prompt_tokens,
-                    SUM(completion_tokens) AS completion_tokens,
-                    SUM(total_tokens) AS total_tokens,
-                    SUM(reasoning_tokens) AS reasoning_tokens,
-                    COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
-                    COALESCE(SUM(missing_price), 0) AS missing_price
-                FROM event_costs
-                WHERE timestamp BETWEEN ? AND ?
-                  AND conversation_id = ?
-                GROUP BY conversation_id
+                    aggregates.conversation_id,
+                    aggregates.last_activity,
+                    last_models.last_model,
+                    aggregates.prompt_tokens,
+                    aggregates.cached_prompt_tokens,
+                    aggregates.completion_tokens,
+                    aggregates.total_tokens,
+                    aggregates.reasoning_tokens,
+                    aggregates.cost_usd,
+                    aggregates.missing_price
+                FROM aggregates
+                LEFT JOIN last_models ON last_models.conv_key = aggregates.conv_key
             "#
             }
             None => {
                 r#"
+                WITH filtered AS (
+                    SELECT
+                        COALESCE(conversation_id, '__unlabeled__') AS conv_key,
+                        conversation_id,
+                        timestamp,
+                        model,
+                        prompt_tokens,
+                        cached_prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        reasoning_tokens,
+                        cost_usd,
+                        missing_price
+                    FROM event_costs
+                    WHERE timestamp BETWEEN ? AND ?
+                      AND conversation_id IS NULL
+                ),
+                aggregates AS (
+                    SELECT
+                        conv_key,
+                        MAX(conversation_id) AS conversation_id,
+                        SUM(prompt_tokens) AS prompt_tokens,
+                        SUM(cached_prompt_tokens) AS cached_prompt_tokens,
+                        SUM(completion_tokens) AS completion_tokens,
+                        SUM(total_tokens) AS total_tokens,
+                        SUM(reasoning_tokens) AS reasoning_tokens,
+                        COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
+                        COALESCE(SUM(missing_price), 0) AS missing_price,
+                        MAX(timestamp) AS last_activity
+                    FROM filtered
+                    GROUP BY conv_key
+                ),
+                last_models AS (
+                    SELECT conv_key, model AS last_model
+                    FROM (
+                        SELECT
+                            conv_key,
+                            model,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY conv_key
+                                ORDER BY timestamp DESC
+                            ) AS rn
+                        FROM filtered
+                    )
+                    WHERE rn = 1
+                )
                 SELECT
-                    conversation_id,
-                    SUM(prompt_tokens) AS prompt_tokens,
-                    SUM(cached_prompt_tokens) AS cached_prompt_tokens,
-                    SUM(completion_tokens) AS completion_tokens,
-                    SUM(total_tokens) AS total_tokens,
-                    SUM(reasoning_tokens) AS reasoning_tokens,
-                    COALESCE(SUM(cost_usd), 0.0) AS cost_usd,
-                    COALESCE(SUM(missing_price), 0) AS missing_price
-                FROM event_costs
-                WHERE timestamp BETWEEN ? AND ?
-                  AND conversation_id IS NULL
-                GROUP BY conversation_id
+                    aggregates.conversation_id,
+                    aggregates.last_activity,
+                    last_models.last_model,
+                    aggregates.prompt_tokens,
+                    aggregates.cached_prompt_tokens,
+                    aggregates.completion_tokens,
+                    aggregates.total_tokens,
+                    aggregates.reasoning_tokens,
+                    aggregates.cost_usd,
+                    aggregates.missing_price
+                FROM aggregates
+                LEFT JOIN last_models ON last_models.conv_key = aggregates.conv_key
             "#
             }
         };
@@ -995,18 +1246,29 @@ impl Storage {
                 .with_context(|| "failed to load conversation totals")?,
         };
 
-        Ok(row.map(|row| ConversationAggregate {
-            conversation_id: row
-                .try_get::<Option<String>, _>("conversation_id")
-                .unwrap_or(None),
-            prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
-            cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0) as u64,
-            completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
-            total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
-            reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
-            cost_usd: cost_from_row(&row),
-            first_title: None,
-            last_summary: None,
+        Ok(row.map(|row| {
+            let last_activity_str: String = row.try_get("last_activity").unwrap_or_default();
+            let last_activity = DateTime::parse_from_rfc3339(&last_activity_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or_else(|_| Utc.timestamp_opt(0, 0).unwrap());
+            ConversationAggregate {
+                conversation_id: row
+                    .try_get::<Option<String>, _>("conversation_id")
+                    .unwrap_or(None),
+                last_activity,
+                last_model: row
+                    .try_get::<String, _>("last_model")
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
+                cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
+                    as u64,
+                completion_tokens: row.try_get::<i64, _>("completion_tokens").unwrap_or(0) as u64,
+                total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
+                reasoning_tokens: row.try_get::<i64, _>("reasoning_tokens").unwrap_or(0) as u64,
+                cost_usd: cost_from_row(&row),
+                first_title: None,
+                last_summary: None,
+            }
         }))
     }
 
@@ -1019,12 +1281,12 @@ impl Storage {
             Some(id) => {
                 sqlx::query(
                     r#"
-                SELECT timestamp, model, prompt_tokens, cached_prompt_tokens,
+                SELECT timestamp, model, summary, prompt_tokens, cached_prompt_tokens,
                        completion_tokens, total_tokens, reasoning_tokens,
                        cost_usd, missing_price, usage_included
                 FROM event_costs
                 WHERE conversation_id = ?1
-                ORDER BY timestamp ASC
+                ORDER BY timestamp DESC
                 LIMIT ?2
                 "#,
                 )
@@ -1036,12 +1298,12 @@ impl Storage {
             None => {
                 sqlx::query(
                     r#"
-                SELECT timestamp, model, prompt_tokens, cached_prompt_tokens,
+                SELECT timestamp, model, summary, prompt_tokens, cached_prompt_tokens,
                        completion_tokens, total_tokens, reasoning_tokens,
                        cost_usd, missing_price, usage_included
                 FROM event_costs
                 WHERE conversation_id IS NULL
-                ORDER BY timestamp ASC
+                ORDER BY timestamp DESC
                 LIMIT ?1
                 "#,
                 )
@@ -1063,6 +1325,7 @@ impl Storage {
                 turn_index: idx as u32 + 1,
                 timestamp,
                 model: row.try_get::<String, _>("model")?,
+                summary: row.try_get::<Option<String>, _>("summary")?,
                 prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
                 cached_prompt_tokens: row.try_get::<i64, _>("cached_prompt_tokens").unwrap_or(0)
                     as u64,
@@ -1129,6 +1392,7 @@ impl Storage {
         Ok(totals)
     }
 
+    #[allow(dead_code)]
     pub async fn recent_events(&self, limit: usize) -> Result<Vec<UsageEvent>> {
         let rows = sqlx::query(
             r#"
@@ -1206,9 +1470,11 @@ impl AggregateTotals {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ConversationAggregate {
     pub conversation_id: Option<String>,
+    pub last_activity: DateTime<Utc>,
+    pub last_model: String,
     pub prompt_tokens: u64,
     pub cached_prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -1217,6 +1483,24 @@ pub struct ConversationAggregate {
     pub cost_usd: Option<f64>,
     pub first_title: Option<String>,
     pub last_summary: Option<String>,
+}
+
+impl Default for ConversationAggregate {
+    fn default() -> Self {
+        Self {
+            conversation_id: None,
+            last_activity: Utc.timestamp_opt(0, 0).unwrap(),
+            last_model: "unknown".to_string(),
+            prompt_tokens: 0,
+            cached_prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            reasoning_tokens: 0,
+            cost_usd: Some(0.0),
+            first_title: None,
+            last_summary: None,
+        }
+    }
 }
 
 impl ConversationAggregate {
@@ -1231,9 +1515,11 @@ impl ConversationAggregate {
 
 #[derive(Debug, Clone)]
 pub struct ConversationTurn {
+    #[allow(dead_code)]
     pub turn_index: u32,
     pub timestamp: DateTime<Utc>,
     pub model: String,
+    pub summary: Option<String>,
     pub prompt_tokens: u64,
     pub cached_prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -1636,7 +1922,15 @@ mod tests {
         storage.ensure_schema().await.unwrap();
 
         let base = Utc::now();
-        insert_price(&storage, "gpt-turn", base.date_naive(), 0.5, Some(0.25), 0.75).await;
+        insert_price(
+            &storage,
+            "gpt-turn",
+            base.date_naive(),
+            0.5,
+            Some(0.25),
+            0.75,
+        )
+        .await;
 
         for (offset, title, summary, conv, prompt, completion) in [
             (60, "first", "done1", Some("conv-x"), 100, 50),
@@ -1667,9 +1961,9 @@ mod tests {
             .unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].turn_index, 1);
-        assert_eq!(turns[0].prompt_tokens, 100);
+        assert_eq!(turns[0].prompt_tokens, 120);
         assert_eq!(turns[1].turn_index, 2);
-        assert_eq!(turns[1].completion_tokens, 60);
+        assert_eq!(turns[1].completion_tokens, 50);
 
         let unlabeled = storage.conversation_turns(None, 10).await.unwrap();
         assert_eq!(unlabeled.len(), 1);

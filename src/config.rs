@@ -135,7 +135,10 @@ pub struct PricingConfig {
     pub currency: String,
     #[serde(default = "default_prompt_rate", alias = "default_prompt_per_1k")]
     pub default_prompt_per_1m: f64,
-    #[serde(default = "default_completion_rate", alias = "default_completion_per_1k")]
+    #[serde(
+        default = "default_completion_rate",
+        alias = "default_completion_per_1k"
+    )]
     pub default_completion_per_1m: f64,
     #[serde(default = "default_model_pricing")]
     pub models: HashMap<String, ModelPricing>,
@@ -152,8 +155,7 @@ impl Default for PricingConfig {
     }
 }
 
-impl PricingConfig {
-}
+impl PricingConfig {}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(from = "ModelPricingInput")]

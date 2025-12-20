@@ -4,7 +4,6 @@ use crate::{
         AggregateTotals, ConversationAggregate, ConversationTurn, MissingPriceRow, NewPrice,
         PriceRow, Storage,
     },
-    usage::UsageEvent,
 };
 use anyhow::{Context, Result};
 use chrono::{
@@ -31,8 +30,10 @@ use std::{
 };
 use tokio::runtime::Handle;
 
-const DETAIL_SNIPPET_LIMIT: usize = 120;
-const TURN_VIEW_LIMIT: usize = 40;
+const TURN_VIEW_LIMIT: usize = 500;
+const LIST_TITLE_MAX_CHARS: usize = 80;
+const MODEL_NAME_MAX_CHARS: usize = 24;
+const CONVERSATION_TABLE_COLUMNS: usize = 11;
 const STATS_HOURLY_COUNT: usize = 24;
 const STATS_DAILY_COUNT: usize = 14;
 const STATS_WEEKLY_COUNT: usize = 8;
@@ -42,7 +43,7 @@ const STATS_YEARLY_COUNT: usize = 5;
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum ViewMode {
     Overview,
-    Conversations,
+    TopSpending,
     Stats,
     Pricing,
 }
@@ -50,26 +51,20 @@ enum ViewMode {
 impl ViewMode {
     fn next(self) -> Self {
         match self {
-            ViewMode::Overview => ViewMode::Conversations,
-            ViewMode::Conversations => ViewMode::Stats,
+            ViewMode::Overview => ViewMode::TopSpending,
+            ViewMode::TopSpending => ViewMode::Stats,
             ViewMode::Stats => ViewMode::Pricing,
             ViewMode::Pricing => ViewMode::Overview,
         }
     }
 }
 
-pub async fn run(
-    config: Arc<AppConfig>,
-    storage: Storage,
-) -> Result<()> {
+pub async fn run(config: Arc<AppConfig>, storage: Storage) -> Result<()> {
     let refresh_hz = config.display.refresh_hz.max(1);
     let tick_rate = Duration::from_millis(1000 / refresh_hz);
     let runtime = Handle::current();
 
-    tokio::task::spawn_blocking(move || {
-        run_blocking(runtime, config, storage, tick_rate)
-    })
-    .await?
+    tokio::task::spawn_blocking(move || run_blocking(runtime, config, storage, tick_rate)).await?
 }
 
 fn run_blocking(
@@ -79,18 +74,20 @@ fn run_blocking(
     tick_rate: Duration,
 ) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let mut conversation_view = ConversationViewState::new();
+    let mut overview_view = RecentConversationViewState::new();
+    let mut top_spending_view = TopSpendingViewState::new();
     let mut stats_view = StatsViewState::new();
     let mut pricing_view = PricingViewState::new();
+    let mut conversation_modal = ConversationModalState::new();
     let mut view_mode = ViewMode::Overview;
 
     let loop_result: Result<()> = (|| -> Result<()> {
         loop {
             let today = Utc::now().date_naive();
-            let recent = runtime
-                .block_on(storage.recent_events(config.display.recent_events_capacity))
+            let recent_conversations = runtime
+                .block_on(storage.recent_conversations())
                 .unwrap_or_else(|err| {
-                    tracing::warn!(error = %err, "failed to load recent events");
+                    tracing::warn!(error = %err, "failed to load recent conversations");
                     Vec::new()
                 });
             let stats = runtime
@@ -104,28 +101,40 @@ fn run_blocking(
                     conversation_limit,
                 ))
                 .context("failed to gather conversation aggregates")?;
-            conversation_view.sync_with(&conversation_stats);
-            let selected_conversation = if matches!(view_mode, ViewMode::Conversations) {
-                conversation_view.selected(&conversation_stats).cloned()
-            } else {
-                None
+            overview_view.sync_with(recent_conversations.len());
+            top_spending_view.sync_with(&conversation_stats);
+
+            let selected_conversation = match view_mode {
+                ViewMode::Overview => overview_view.selected(&recent_conversations),
+                ViewMode::TopSpending => top_spending_view.selected(&conversation_stats),
+                _ => None,
             };
-            let conversation_turns =
-                if let (ViewMode::Conversations, Some(selected)) =
-                    (view_mode, selected_conversation.as_ref())
-                {
-                    runtime
-                        .block_on(storage.conversation_turns(
-                            selected.conversation_id.as_deref(),
-                            TURN_VIEW_LIMIT,
-                        ))
-                        .unwrap_or_else(|err| {
-                            tracing::warn!(error = %err, "failed to load conversation turns");
-                            Vec::new()
-                        })
-                } else {
-                    Vec::new()
-                };
+
+            if conversation_modal.is_open() && selected_conversation.is_none() {
+                conversation_modal.close();
+            }
+
+            let conversation_turns = if conversation_modal.is_open() {
+                selected_conversation
+                    .and_then(|selected| {
+                        runtime
+                            .block_on(storage.conversation_turns(
+                                selected.conversation_id.as_deref(),
+                                TURN_VIEW_LIMIT,
+                            ))
+                            .map_err(|err| {
+                                tracing::warn!(
+                                    error = %err,
+                                    "failed to load conversation turns"
+                                );
+                                err
+                            })
+                            .ok()
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
             let stats_breakdown = if matches!(view_mode, ViewMode::Stats) {
                 let breakdown = runtime
                     .block_on(StatsBreakdown::gather(&storage, Utc::now()))
@@ -136,10 +145,12 @@ fn run_blocking(
                 None
             };
             let (pricing_rows, pricing_missing) = if matches!(view_mode, ViewMode::Pricing) {
-                let rows = runtime.block_on(storage.list_prices()).unwrap_or_else(|err| {
-                    tracing::warn!(error = %err, "failed to load price list");
-                    Vec::new()
-                });
+                let rows = runtime
+                    .block_on(storage.list_prices())
+                    .unwrap_or_else(|err| {
+                        tracing::warn!(error = %err, "failed to load price list");
+                        Vec::new()
+                    });
                 let missing = runtime
                     .block_on(storage.missing_price_models(6))
                     .unwrap_or_else(|err| {
@@ -158,13 +169,15 @@ fn run_blocking(
                     frame,
                     &config,
                     &stats,
-                    &recent,
+                    &recent_conversations,
+                    &mut overview_view,
                     &conversation_stats,
-                    &conversation_view,
+                    &mut top_spending_view,
                     &stats_view,
                     &pricing_view,
-                    selected_conversation.as_ref(),
+                    selected_conversation,
                     &conversation_turns,
+                    &mut conversation_modal,
                     stats_breakdown.as_ref(),
                     pricing_rows.as_deref(),
                     pricing_missing.as_deref(),
@@ -180,6 +193,16 @@ fn run_blocking(
                             && key.modifiers.contains(KeyModifiers::CONTROL))
                     {
                         break Ok(());
+                    }
+
+                    if conversation_modal.is_open()
+                        && handle_conversation_modal_input(
+                            &mut conversation_modal,
+                            key,
+                            conversation_turns.len(),
+                        )
+                    {
+                        continue;
                     }
 
                     if handle_pricing_input(
@@ -200,7 +223,7 @@ fn run_blocking(
                             view_mode = ViewMode::Overview;
                         }
                         KeyCode::Char('2') => {
-                            view_mode = ViewMode::Conversations;
+                            view_mode = ViewMode::TopSpending;
                         }
                         KeyCode::Char('3') => {
                             view_mode = ViewMode::Stats;
@@ -215,33 +238,80 @@ fn run_blocking(
                             view_mode = ViewMode::Overview;
                         }
                         KeyCode::Left | KeyCode::Char('h') => match view_mode {
-                            ViewMode::Conversations => {
-                                conversation_view.prev_period(conversation_stats.periods_len())
+                            ViewMode::TopSpending => {
+                                top_spending_view.prev_period(conversation_stats.periods_len())
                             }
                             ViewMode::Stats => stats_view.prev_period(),
                             _ => {}
                         },
                         KeyCode::Right | KeyCode::Char('l') => match view_mode {
-                            ViewMode::Conversations => {
-                                conversation_view.next_period(conversation_stats.periods_len())
+                            ViewMode::TopSpending => {
+                                top_spending_view.next_period(conversation_stats.periods_len())
                             }
                             ViewMode::Stats => stats_view.next_period(),
                             _ => {}
                         },
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if matches!(view_mode, ViewMode::Conversations) {
-                                let rows = conversation_stats
-                                    .active_period_len(conversation_view.active_period);
-                                conversation_view.move_selection_up(rows);
+                        KeyCode::Up | KeyCode::Char('k') => match view_mode {
+                            ViewMode::Overview => {
+                                overview_view.move_selection_up(recent_conversations.len());
                             }
-                        }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if matches!(view_mode, ViewMode::Conversations) {
+                            ViewMode::TopSpending => {
                                 let rows = conversation_stats
-                                    .active_period_len(conversation_view.active_period);
-                                conversation_view.move_selection_down(rows);
+                                    .active_period_len(top_spending_view.active_period);
+                                top_spending_view.move_selection_up(rows);
                             }
-                        }
+                            _ => {}
+                        },
+                        KeyCode::Down | KeyCode::Char('j') => match view_mode {
+                            ViewMode::Overview => {
+                                overview_view.move_selection_down(recent_conversations.len());
+                            }
+                            ViewMode::TopSpending => {
+                                let rows = conversation_stats
+                                    .active_period_len(top_spending_view.active_period);
+                                top_spending_view.move_selection_down(rows);
+                            }
+                            _ => {}
+                        },
+                        KeyCode::PageUp => match view_mode {
+                            ViewMode::Overview => {
+                                overview_view.page_up(recent_conversations.len());
+                            }
+                            ViewMode::TopSpending => {
+                                let rows = conversation_stats
+                                    .active_period_len(top_spending_view.active_period);
+                                top_spending_view.page_up(rows);
+                            }
+                            _ => {}
+                        },
+                        KeyCode::PageDown => match view_mode {
+                            ViewMode::Overview => {
+                                overview_view.page_down(recent_conversations.len());
+                            }
+                            ViewMode::TopSpending => {
+                                let rows = conversation_stats
+                                    .active_period_len(top_spending_view.active_period);
+                                top_spending_view.page_down(rows);
+                            }
+                            _ => {}
+                        },
+                        KeyCode::Enter => match view_mode {
+                            ViewMode::Overview => {
+                                if let Some(selected) =
+                                    overview_view.selected(&recent_conversations)
+                                {
+                                    conversation_modal.open_for(conversation_key(selected));
+                                }
+                            }
+                            ViewMode::TopSpending => {
+                                if let Some(selected) =
+                                    top_spending_view.selected(&conversation_stats)
+                                {
+                                    conversation_modal.open_for(conversation_key(selected));
+                                }
+                            }
+                            _ => {}
+                        },
                         _ => {}
                     }
                 }
@@ -280,43 +350,64 @@ fn draw_ui(
     frame: &mut Frame,
     config: &AppConfig,
     stats: &SummaryStats,
-    recent: &[UsageEvent],
+    recent_conversations: &[ConversationAggregate],
+    overview_view: &mut RecentConversationViewState,
     conversations: &ConversationStats,
-    conversation_view: &ConversationViewState,
+    top_spending_view: &mut TopSpendingViewState,
     stats_view: &StatsViewState,
     pricing_view: &PricingViewState,
     selected: Option<&ConversationAggregate>,
     turns: &[ConversationTurn],
+    conversation_modal: &mut ConversationModalState,
     stats_breakdown: Option<&StatsBreakdown>,
     pricing_rows: Option<&[PriceRow]>,
     pricing_missing: Option<&[MissingPriceRow]>,
     show_cursor: bool,
     view_mode: ViewMode,
 ) {
+    let dim_background = conversation_modal.is_open() || pricing_view.modal.is_some();
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(0)])
         .split(frame.size());
-    render_navbar(frame, layout[0], view_mode);
+    render_navbar(frame, layout[0], view_mode, dim_background);
 
     match view_mode {
-        ViewMode::Overview => draw_overview(frame, layout[1], config, stats, recent),
-        ViewMode::Conversations => draw_conversation_view(
+        ViewMode::Overview => draw_overview(
+            frame,
+            layout[1],
+            config,
+            stats,
+            recent_conversations,
+            overview_view,
+            dim_background,
+        ),
+        ViewMode::TopSpending => draw_top_spending_view(
             frame,
             layout[1],
             conversations,
-            conversation_view,
-            selected,
-            turns,
+            top_spending_view,
+            dim_background,
         ),
-        ViewMode::Stats => draw_stats_view(frame, layout[1], stats_breakdown, stats_view),
+        ViewMode::Stats => draw_stats_view(
+            frame,
+            layout[1],
+            stats_breakdown,
+            stats_view,
+            dim_background,
+        ),
         ViewMode::Pricing => draw_pricing_view(
             frame,
             layout[1],
             pricing_rows.unwrap_or(&[]),
             pricing_missing.unwrap_or(&[]),
             pricing_view,
+            dim_background,
         ),
+    }
+
+    if conversation_modal.is_open() {
+        render_conversation_modal(frame, selected, turns, conversation_modal);
     }
 
     if let ViewMode::Pricing = view_mode {
@@ -329,34 +420,29 @@ fn draw_ui(
 fn draw_overview(
     frame: &mut Frame,
     area: Rect,
-    config: &AppConfig,
+    _config: &AppConfig,
     stats: &SummaryStats,
-    recent: &[UsageEvent],
+    recent_conversations: &[ConversationAggregate],
+    view: &mut RecentConversationViewState,
+    dim: bool,
 ) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(6), Constraint::Min(10)])
         .split(area);
 
-    render_summary(frame, layout[0], stats);
-    render_recent_events(frame, layout[1], config, recent);
+    render_summary(frame, layout[0], stats, dim);
+    render_recent_conversations(frame, layout[1], recent_conversations, view, dim);
 }
 
-fn draw_conversation_view(
+fn draw_top_spending_view(
     frame: &mut Frame,
     area: Rect,
     conversations: &ConversationStats,
-    view: &ConversationViewState,
-    selected: Option<&ConversationAggregate>,
-    turns: &[ConversationTurn],
+    view: &mut TopSpendingViewState,
+    dim: bool,
 ) {
-    let layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
-        .split(area);
-
-    render_conversation_table(frame, layout[0], conversations, view);
-    render_conversation_panel(frame, layout[1], selected, turns);
+    render_top_spending_table(frame, area, conversations, view, dim);
 }
 
 fn draw_stats_view(
@@ -364,9 +450,11 @@ fn draw_stats_view(
     area: Rect,
     stats: Option<&StatsBreakdown>,
     view: &StatsViewState,
+    dim: bool,
 ) {
     match stats.and_then(|data| data.period(view.active_period)) {
         Some(period) => {
+            let theme = ui_theme(dim);
             let widths = [
                 Constraint::Length(18),
                 Constraint::Length(14),
@@ -395,27 +483,33 @@ fn draw_stats_view(
                 .collect();
 
             let table = Table::new(rows, widths)
-                .header(light_blue_header(vec![
-                    "Period",
-                    "Cost",
-                    "Input",
-                    "Cached",
-                    "Output",
-                    "Reasoning",
-                    "Blended",
-                    "API",
-                ]))
-                .block(gray_block(format!(
-                    "Detailed Usage – {} (←/→ switch period)",
-                    period.label
-                )))
-                .column_spacing(1);
+                .header(light_blue_header(
+                    vec![
+                        "Period",
+                        "Cost",
+                        "Input",
+                        "Cached",
+                        "Output",
+                        "Reasoning",
+                        "Blended",
+                        "API",
+                    ],
+                    &theme,
+                ))
+                .block(gray_block(
+                    format!("Detailed Usage – {} (←/→ switch period)", period.label),
+                    &theme,
+                ))
+                .column_spacing(1)
+                .style(Style::default().fg(theme.text_fg));
 
             frame.render_widget(table, area);
         }
         None => {
-            let paragraph =
-                Paragraph::new("Loading stats…").block(gray_block("Detailed Usage Statistics"));
+            let theme = ui_theme(dim);
+            let paragraph = Paragraph::new("Loading stats…")
+                .block(gray_block("Detailed Usage Statistics", &theme))
+                .style(Style::default().fg(theme.text_fg));
             frame.render_widget(paragraph, area);
         }
     }
@@ -427,32 +521,30 @@ fn draw_pricing_view(
     prices: &[PriceRow],
     missing: &[MissingPriceRow],
     view: &PricingViewState,
+    dim: bool,
 ) {
+    let theme = ui_theme(dim);
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(4), Constraint::Min(0)])
         .split(area);
 
-    render_missing_prices(frame, layout[0], missing);
+    render_missing_prices(frame, layout[0], missing, &theme);
 
-    let header = light_blue_header(vec![
-        "Model Prefix",
-        "Effective From",
-        "Currency",
-        "Prompt /1M",
-        "Cached /1M",
-        "Completion /1M",
-    ]);
+    let header = light_blue_header(
+        vec![
+            "Model Prefix",
+            "Effective From",
+            "Currency",
+            "Prompt /1M",
+            "Cached /1M",
+            "Completion /1M",
+        ],
+        &theme,
+    );
 
     let rows: Vec<Row> = if prices.is_empty() {
-        vec![Row::new(vec![
-            "No prices configured",
-            "",
-            "",
-            "",
-            "",
-            "",
-        ])]
+        vec![Row::new(vec!["No prices configured", "", "", "", "", ""])]
     } else {
         prices
             .iter()
@@ -472,8 +564,8 @@ fn draw_pricing_view(
                 if idx == view.selected_row {
                     row = row.style(
                         Style::default()
-                            .fg(Color::White)
-                            .bg(Color::Blue)
+                            .fg(theme.highlight_fg)
+                            .bg(theme.highlight_bg)
                             .add_modifier(Modifier::BOLD),
                     );
                 }
@@ -495,8 +587,10 @@ fn draw_pricing_view(
         .header(header)
         .block(gray_block(
             "Pricing (a=add, Enter=edit, d=delete; ↑/↓ or j/k to move)",
+            &theme,
         ))
-        .column_spacing(1);
+        .column_spacing(1)
+        .style(Style::default().fg(theme.text_fg));
 
     frame.render_widget(table, layout[1]);
 }
@@ -504,18 +598,32 @@ fn draw_pricing_view(
 fn render_pricing_modal(frame: &mut Frame, modal: &PricingModal, show_cursor: bool) {
     let area = centered_rect(70, 60, frame.size());
     frame.render_widget(Clear, area);
+    let title = match modal {
+        PricingModal::Create(_) => "Create Price",
+        PricingModal::Update { .. } => "Update Price",
+        PricingModal::DeleteConfirm { .. } => "Delete Price",
+    };
+    let title_span = Span::styled(
+        format!(" {title} "),
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
         .style(Style::default().bg(Color::Black))
-        .title(match modal {
-            PricingModal::Create(_) => "Create Price",
-            PricingModal::Update { .. } => "Update Price",
-            PricingModal::DeleteConfirm { .. } => "Delete Price",
-        });
+        .title(title_span);
 
     match modal {
         PricingModal::Create(form) => render_price_form(frame, area, block, form, show_cursor),
-        PricingModal::Update { form, .. } => render_price_form(frame, area, block, form, show_cursor),
+        PricingModal::Update { form, .. } => {
+            render_price_form(frame, area, block, form, show_cursor)
+        }
         PricingModal::DeleteConfirm { label, error, .. } => {
             let mut lines = vec![
                 Line::from(format!("Delete price for {label}?")),
@@ -533,10 +641,17 @@ fn render_pricing_modal(frame: &mut Frame, modal: &PricingModal, show_cursor: bo
     }
 }
 
-fn render_missing_prices(frame: &mut Frame, area: Rect, missing: &[MissingPriceRow]) {
-    let block = gray_block("Missing Prices (add or adjust effective_from)");
+fn render_missing_prices(
+    frame: &mut Frame,
+    area: Rect,
+    missing: &[MissingPriceRow],
+    theme: &UiTheme,
+) {
+    let block = gray_block("Missing Prices (add or adjust effective_from)", theme);
     if missing.is_empty() {
-        let paragraph = Paragraph::new("No missing prices detected.").block(block);
+        let paragraph = Paragraph::new("No missing prices detected.")
+            .block(block)
+            .style(Style::default().fg(theme.text_fg));
         frame.render_widget(paragraph, area);
         return;
     }
@@ -551,7 +666,10 @@ fn render_missing_prices(frame: &mut Frame, area: Rect, missing: &[MissingPriceR
         ));
     }
     let text = format!("Missing prices for: {}", parts.join(" • "));
-    let paragraph = Paragraph::new(text).wrap(Wrap { trim: true }).block(block);
+    let paragraph = Paragraph::new(text)
+        .wrap(Wrap { trim: true })
+        .block(block)
+        .style(Style::default().fg(theme.text_fg));
     frame.render_widget(paragraph, area);
 }
 
@@ -571,7 +689,11 @@ fn render_price_form(
         ),
         (PricingField::Currency, "Currency", &form.currency),
         (PricingField::Prompt, "Prompt /1M", &form.prompt_per_1m),
-        (PricingField::Cached, "Cached /1M (optional)", &form.cached_prompt_per_1m),
+        (
+            PricingField::Cached,
+            "Cached /1M (optional)",
+            &form.cached_prompt_per_1m,
+        ),
         (
             PricingField::Completion,
             "Completion /1M",
@@ -643,6 +765,80 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
     horizontal[1]
 }
 
+fn visible_rows_for_table(area: Rect) -> usize {
+    area.height.saturating_sub(3) as usize
+}
+
+struct UiTheme {
+    header_fg: Color,
+    border_fg: Color,
+    nav_active_fg: Color,
+    label_fg: Color,
+    text_fg: Color,
+    highlight_fg: Color,
+    highlight_bg: Color,
+}
+
+fn ui_theme(dim: bool) -> UiTheme {
+    if dim {
+        UiTheme {
+            header_fg: Color::DarkGray,
+            border_fg: Color::DarkGray,
+            nav_active_fg: Color::Gray,
+            label_fg: Color::DarkGray,
+            text_fg: Color::DarkGray,
+            highlight_fg: Color::Gray,
+            highlight_bg: Color::DarkGray,
+        }
+    } else {
+        UiTheme {
+            header_fg: Color::Cyan,
+            border_fg: Color::DarkGray,
+            nav_active_fg: Color::Yellow,
+            label_fg: Color::Gray,
+            text_fg: Color::Reset,
+            highlight_fg: Color::White,
+            highlight_bg: Color::Blue,
+        }
+    }
+}
+
+fn conversation_list_widths(area: Rect) -> Vec<Constraint> {
+    let spacing = (CONVERSATION_TABLE_COLUMNS - 1) as u16;
+    let total = area.width.saturating_sub(spacing) as i32;
+    let fixed = [
+        12, // Time
+        18, // Conversation
+        20, // Model
+        9,  // Cost
+        8,  // Input
+        8,  // Cached
+        8,  // Output
+        8,  // Blended
+        8,  // API
+        9,  // Reasoning
+    ];
+    let fixed_total: i32 = fixed.iter().sum();
+    let mut title_width = total - fixed_total;
+    if title_width < 24 {
+        title_width = 24;
+    }
+
+    vec![
+        Constraint::Length(fixed[0] as u16),
+        Constraint::Length(fixed[1] as u16),
+        Constraint::Length(title_width as u16),
+        Constraint::Length(fixed[2] as u16),
+        Constraint::Length(fixed[3] as u16),
+        Constraint::Length(fixed[4] as u16),
+        Constraint::Length(fixed[5] as u16),
+        Constraint::Length(fixed[6] as u16),
+        Constraint::Length(fixed[7] as u16),
+        Constraint::Length(fixed[8] as u16),
+        Constraint::Length(fixed[9] as u16),
+    ]
+}
+
 fn format_rate(value: f64) -> String {
     format!("{:.4}", value)
 }
@@ -655,10 +851,11 @@ fn should_show_cursor() -> bool {
     (now / 500) % 2 == 0
 }
 
-fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode) {
+fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode, dim: bool) {
+    let theme = ui_theme(dim);
     let tabs = [
         (ViewMode::Overview, "1 Overview"),
-        (ViewMode::Conversations, "2 Conversations"),
+        (ViewMode::TopSpending, "2 Top Spending"),
         (ViewMode::Stats, "3 Stats"),
         (ViewMode::Pricing, "4 Pricing"),
     ];
@@ -668,7 +865,7 @@ fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode) {
             Span::styled(
                 format!(" {label} "),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(theme.nav_active_fg)
                     .add_modifier(Modifier::BOLD),
             )
         } else {
@@ -680,13 +877,20 @@ fn render_navbar(frame: &mut Frame, area: Rect, view_mode: ViewMode) {
         }
     }
     let line = Line::from(spans);
-    let paragraph =
-        Paragraph::new(line).block(gray_block("Tabs (1/2/3/4, Tab to cycle, 'q' quits)"));
+    let paragraph = Paragraph::new(line)
+        .block(gray_block(
+            "Tabs (1/2/3/4, Tab to cycle, 'q' quits)",
+            &theme,
+        ))
+        .style(Style::default().fg(theme.text_fg));
     frame.render_widget(paragraph, area);
 }
 
-fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
-    let header_style = Style::default().add_modifier(Modifier::BOLD);
+fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats, dim: bool) {
+    let theme = ui_theme(dim);
+    let header_style = Style::default()
+        .fg(theme.header_fg)
+        .add_modifier(Modifier::BOLD);
     let rows = vec![
         build_summary_row("Last 10 min", &stats.last_10m, header_style),
         build_summary_row("Last 1 hr", &stats.last_hour, header_style),
@@ -705,17 +909,21 @@ fn render_summary(frame: &mut Frame, area: Rect, stats: &SummaryStats) {
         Constraint::Length(16),
     ];
     let table = Table::new(rows, widths)
-        .header(light_blue_header(vec![
-            "Period",
-            "Cost (USD)",
-            "Input",
-            "Cached",
-            "Output",
-            "Reasoning",
-            "Blended",
-            "API Total",
-        ]))
-        .block(gray_block("Usage Totals"));
+        .header(light_blue_header(
+            vec![
+                "Period",
+                "Cost (USD)",
+                "Input",
+                "Cached",
+                "Output",
+                "Reasoning",
+                "Blended",
+                "API Total",
+            ],
+            &theme,
+        ))
+        .block(gray_block("Usage Totals", &theme))
+        .style(Style::default().fg(theme.text_fg));
 
     frame.render_widget(table, area);
 }
@@ -733,189 +941,32 @@ fn build_summary_row<'a>(label: &'a str, totals: &AggregateTotals, style: Style)
     ])
 }
 
-fn render_recent_events(frame: &mut Frame, area: Rect, config: &AppConfig, recent: &[UsageEvent]) {
-    let header = light_blue_header(vec![
-        "Time",
-        "Conversation",
-        "",
-        "Title",
-        "",
-        "Result",
-        "",
-        "Model",
-        "Cost",
-        "Input",
-        "Cached",
-        "Output",
-        "Blended",
-        "API",
-        "Reasoning",
-    ]);
-
-    let rows = if recent.is_empty() {
-        vec![Row::new(vec![
-            "–",
-            "No recent requests",
-            "",
-            "No recent responses",
-            "",
-            "–",
-            "",
-            "–",
-            "–",
-            "–",
-            "–",
-            "–",
-            "–",
-            "–",
-            "–",
-        ])]
-    } else {
-        recent
-            .iter()
-            .take(config.display.recent_events_capacity)
-            .map(|event| {
-                let row = Row::new(vec![
-                    event.timestamp.format("%H:%M:%S").to_string(),
-                    format_conversation_label(event.conversation_id.as_ref()),
-                    String::new(),
-                    event.title.clone().unwrap_or_else(|| "—".to_string()),
-                    String::new(),
-                    event.summary.clone().unwrap_or_else(|| "—".to_string()),
-                    String::new(),
-                    event.model.clone(),
-                    format_usage_cost(event),
-                    format_usage_tokens(event, event.prompt_tokens),
-                    format_usage_tokens(event, event.cached_prompt_tokens),
-                    format_usage_tokens(event, event.completion_tokens),
-                    format_usage_tokens(event, event.blended_total()),
-                    format_usage_tokens(event, event.total_tokens),
-                    format_usage_tokens(event, event.reasoning_tokens),
-                ]);
-
-                if event.usage_included {
-                    row
-                } else {
-                    row.style(
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )
-                }
-            })
-            .collect()
-    };
-
-    let widths = [
-        Constraint::Length(10),
-        Constraint::Length(18),
-        Constraint::Length(1),
-        Constraint::Length(32),
-        Constraint::Length(1),
-        Constraint::Length(40),
-        Constraint::Length(1),
-        Constraint::Length(16),
-        Constraint::Length(11),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
-        Constraint::Length(9),
-    ];
-
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(gray_block("Recent Requests"))
-        .column_spacing(1);
-
-    frame.render_widget(table, area);
-}
-
-fn render_conversation_metadata(
+fn render_recent_conversations(
     frame: &mut Frame,
     area: Rect,
-    selected: Option<&ConversationAggregate>,
+    conversations: &[ConversationAggregate],
+    view: &mut RecentConversationViewState,
+    dim: bool,
 ) {
-    let detail_block = gray_block("Conversation Details");
-    let rows = selected
-        .map(|aggregate| conversation_detail_rows(aggregate))
-        .unwrap_or_else(|| vec![Row::new(vec!["Selected", "None"])]);
-
-    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(0)])
-        .block(detail_block)
-        .column_spacing(1);
-    frame.render_widget(table, area);
+    let theme = ui_theme(dim);
+    let total = conversations.len();
+    let visible_rows = visible_rows_for_table(area);
+    view.list.set_visible_rows(visible_rows, total);
+    let (page, pages) = view.list.page_info(total);
+    let title = format!(
+        "Recent Conversations – {total} total • page {page}/{pages} (↑/↓ PgUp/PgDn navigate, Enter details)"
+    );
+    render_conversation_list_table(frame, area, conversations, &mut view.list, title, &theme);
 }
 
-fn render_turn_table(
-    frame: &mut Frame,
-    area: Rect,
-    selected: Option<&ConversationAggregate>,
-    turns: &[ConversationTurn],
-) {
-    let title = selected
-        .map(|aggregate| {
-            format!(
-                "Conversation Turns – {} (full history; totals follow selected period)",
-                full_conversation_label(aggregate.conversation_id.as_ref())
-            )
-        })
-        .unwrap_or_else(|| "Conversation Turns".to_string());
-    let block = gray_block(title);
-    let header = light_blue_header(vec![
-        "#", "Time", "Model", "Cost", "Input", "Cached", "Output", "Blended", "API", "Reason",
-    ]);
-
-    let rows: Vec<Row> = if turns.is_empty() {
-        vec![Row::new(vec![
-            "–", "No turns", "", "", "", "", "", "", "", "",
-        ])]
-    } else {
-        turns
-            .iter()
-            .map(|turn| {
-                Row::new(vec![
-                    turn.turn_index.to_string(),
-                    turn.timestamp.format("%H:%M:%S").to_string(),
-                    truncate_text(&turn.model, 18),
-                    format_turn_cost(turn.usage_included, turn.cost_usd),
-                    format_turn_tokens(turn.usage_included, turn.prompt_tokens),
-                    format_turn_tokens(turn.usage_included, turn.cached_prompt_tokens),
-                    format_turn_tokens(turn.usage_included, turn.completion_tokens),
-                    format_turn_tokens(turn.usage_included, turn.blended_total()),
-                    format_turn_tokens(turn.usage_included, turn.total_tokens),
-                    format_turn_tokens(turn.usage_included, turn.reasoning_tokens),
-                ])
-            })
-            .collect()
-    };
-
-    let widths = [
-        Constraint::Length(3),
-        Constraint::Length(9),
-        Constraint::Length(18),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-    ];
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(block)
-        .column_spacing(1);
-    frame.render_widget(table, area);
-}
-
-fn render_conversation_table(
+fn render_top_spending_table(
     frame: &mut Frame,
     area: Rect,
     stats: &ConversationStats,
-    view: &ConversationViewState,
+    view: &mut TopSpendingViewState,
+    dim: bool,
 ) {
+    let theme = ui_theme(dim);
     let (label, aggregates): (&str, &[ConversationAggregate]) =
         if let Some(period) = stats.period(view.active_period) {
             (period.label, &period.aggregates)
@@ -923,35 +974,78 @@ fn render_conversation_table(
             ("No Data", &[])
         };
 
-    let header = light_blue_header(vec![
-        "Conversation",
-        "Cost",
-        "Input",
-        "Cached",
-        "Output",
-        "Blended",
-        "API",
-        "Reasoning",
-    ]);
+    let total = aggregates.len();
+    let visible_rows = visible_rows_for_table(area);
+    view.list.set_visible_rows(visible_rows, total);
+    let (page, pages) = view.list.page_info(total);
+    let title = format!(
+        "Top Spending – {label} • {total} conversations • page {page}/{pages} (←/→ period, ↑/↓ PgUp/PgDn, Enter details)"
+    );
+    render_conversation_list_table(frame, area, aggregates, &mut view.list, title, &theme);
+}
 
-    let rows: Vec<Row> = if aggregates.is_empty() {
+fn render_conversation_list_table(
+    frame: &mut Frame,
+    area: Rect,
+    conversations: &[ConversationAggregate],
+    list: &mut ListState,
+    title: String,
+    theme: &UiTheme,
+) {
+    let visible_rows = list.visible_rows;
+
+    let header = light_blue_header(
+        vec![
+            "Time",
+            " Conversation",
+            " Title",
+            "Model",
+            "Cost",
+            "Input",
+            "Cached",
+            "Output",
+            "Blended",
+            "API",
+            "Reasoning",
+        ],
+        theme,
+    );
+
+    let rows: Vec<Row> = if conversations.is_empty() {
         vec![Row::new(vec![
-            "No conversations",
             "–",
-            "–",
-            "–",
-            "–",
-            "–",
-            "–",
-            "–",
+            " No conversations",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
         ])]
     } else {
-        aggregates
+        let start = list.scroll_offset;
+        let end = (start + visible_rows).min(conversations.len());
+        conversations[start..end]
             .iter()
             .enumerate()
-            .map(|(idx, aggregate)| {
-                let mut row = Row::new(vec![
-                    format_conversation_label(aggregate.conversation_id.as_ref()),
+            .map(|(offset, aggregate)| {
+                let idx = start + offset;
+                let title = aggregate
+                    .first_title
+                    .as_ref()
+                    .map(|value| truncate_text(value, LIST_TITLE_MAX_CHARS))
+                    .unwrap_or_else(|| "—".to_string());
+                let row = Row::new(vec![
+                    aggregate.last_activity.format("%b %d %H:%M").to_string(),
+                    format!(
+                        " {}",
+                        format_conversation_label(aggregate.conversation_id.as_ref())
+                    ),
+                    format!(" {}", title),
+                    truncate_text(&aggregate.last_model, MODEL_NAME_MAX_CHARS),
                     format_cost(aggregate.cost_usd),
                     format_tokens(aggregate.prompt_tokens),
                     format_tokens(aggregate.cached_prompt_tokens),
@@ -960,53 +1054,185 @@ fn render_conversation_table(
                     format_tokens(aggregate.total_tokens),
                     format_tokens(aggregate.reasoning_tokens),
                 ]);
-                if idx == view.selected_row {
-                    row = row.style(
+                if idx == list.selected_row {
+                    row.style(
                         Style::default()
-                            .fg(Color::White)
-                            .bg(Color::Blue)
+                            .fg(theme.highlight_fg)
+                            .bg(theme.highlight_bg)
                             .add_modifier(Modifier::BOLD),
-                    );
+                    )
+                } else {
+                    row
                 }
-                row
+            })
+            .collect()
+    };
+
+    let widths = conversation_list_widths(area);
+
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(gray_block(title, theme))
+        .column_spacing(1)
+        .style(Style::default().fg(theme.text_fg));
+
+    frame.render_widget(table, area);
+}
+
+fn render_conversation_metadata(
+    frame: &mut Frame,
+    area: Rect,
+    selected: Option<&ConversationAggregate>,
+    theme: &UiTheme,
+) {
+    let detail_block = gray_block("Conversation Details", theme);
+    let rows = selected
+        .map(|aggregate| conversation_detail_rows(aggregate, theme))
+        .unwrap_or_else(|| vec![Row::new(vec!["Selected", "None"])]);
+
+    let table = Table::new(rows, [Constraint::Length(18), Constraint::Min(0)])
+        .block(detail_block)
+        .column_spacing(1)
+        .style(Style::default().fg(theme.text_fg));
+    frame.render_widget(table, area);
+}
+
+fn render_conversation_modal(
+    frame: &mut Frame,
+    selected: Option<&ConversationAggregate>,
+    turns: &[ConversationTurn],
+    modal: &mut ConversationModalState,
+) {
+    let Some(selected) = selected else {
+        return;
+    };
+
+    let theme = ui_theme(false);
+    let area = centered_rect(92, 90, frame.size());
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(4),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+
+    render_modal_header(frame, layout[0], selected);
+    render_conversation_metadata(frame, layout[1], Some(selected), &theme);
+
+    let visible_rows = visible_rows_for_table(layout[2]);
+    modal.set_visible_rows(visible_rows, turns.len());
+    render_conversation_turns_table(frame, layout[2], turns, modal.scroll_offset(), &theme);
+}
+
+fn render_modal_header(frame: &mut Frame, area: Rect, selected: &ConversationAggregate) {
+    let label = format!(
+        " Conversation {}  (Esc to close) ",
+        full_conversation_label(selected.conversation_id.as_ref())
+    );
+    let max_chars = area.width.saturating_sub(1) as usize;
+    let text = if max_chars > 0 {
+        truncate_text(&label, max_chars)
+    } else {
+        label
+    };
+    let style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let paragraph = Paragraph::new(Line::from(Span::styled(text, style))).style(style);
+    frame.render_widget(paragraph, area);
+}
+
+fn render_conversation_turns_table(
+    frame: &mut Frame,
+    area: Rect,
+    turns: &[ConversationTurn],
+    scroll_offset: usize,
+    theme: &UiTheme,
+) {
+    let header = light_blue_header(
+        vec![
+            "Time",
+            "Model",
+            "Result",
+            "Cost",
+            "Input",
+            "Cached",
+            "Blended",
+            "Output",
+            "API",
+            "Reasoning",
+        ],
+        theme,
+    );
+
+    let visible_rows = visible_rows_for_table(area);
+    let rows: Vec<Row> = if turns.is_empty() {
+        vec![Row::new(vec![
+            "–", "No turns", "", "", "", "", "", "", "", "",
+        ])]
+    } else {
+        let start = scroll_offset.min(turns.len());
+        let end = (start + visible_rows).min(turns.len());
+        turns[start..end]
+            .iter()
+            .map(|turn| {
+                let result = turn
+                    .summary
+                    .as_ref()
+                    .map(|value| truncate_text(value, LIST_TITLE_MAX_CHARS))
+                    .unwrap_or_else(|| "—".to_string());
+                Row::new(vec![
+                    turn.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                    truncate_text(&turn.model, MODEL_NAME_MAX_CHARS),
+                    result,
+                    format_turn_cost(turn.usage_included, turn.cost_usd),
+                    format_turn_tokens(turn.usage_included, turn.prompt_tokens),
+                    format_turn_tokens(turn.usage_included, turn.cached_prompt_tokens),
+                    format_turn_tokens(turn.usage_included, turn.blended_total()),
+                    format_turn_tokens(turn.usage_included, turn.completion_tokens),
+                    format_turn_tokens(turn.usage_included, turn.total_tokens),
+                    format_turn_tokens(turn.usage_included, turn.reasoning_tokens),
+                ])
             })
             .collect()
     };
 
     let widths = [
+        Constraint::Length(19),
         Constraint::Length(18),
-        Constraint::Length(12),
+        Constraint::Min(24),
         Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
-        Constraint::Length(10),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(7),
+        Constraint::Length(9),
     ];
     let table = Table::new(rows, widths)
         .header(header)
-        .block(gray_block(format!(
-            "Top Conversations – {} (←/→ switch period, ↑/↓ select)",
-            label
-        )))
-        .column_spacing(1);
-
+        .block(gray_block(
+            "Conversation Turns (↑/↓ PgUp/PgDn scroll)",
+            theme,
+        ))
+        .column_spacing(1)
+        .style(Style::default().fg(theme.text_fg));
     frame.render_widget(table, area);
-}
-
-fn render_conversation_panel(
-    frame: &mut Frame,
-    area: Rect,
-    selected: Option<&ConversationAggregate>,
-    turns: &[ConversationTurn],
-) {
-    let detail_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(6)])
-        .split(area);
-
-    render_conversation_metadata(frame, detail_layout[0], selected);
-    render_turn_table(frame, detail_layout[1], selected, turns);
 }
 
 fn format_tokens(value: u64) -> String {
@@ -1026,22 +1252,6 @@ fn format_cost(cost: Option<f64>) -> String {
     }
 }
 
-fn format_usage_tokens(event: &UsageEvent, value: u64) -> String {
-    if event.usage_included {
-        format_tokens(value)
-    } else {
-        "n/a".to_string()
-    }
-}
-
-fn format_usage_cost(event: &UsageEvent) -> String {
-    if event.usage_included {
-        format_cost(event.cost_usd)
-    } else {
-        "n/a".to_string()
-    }
-}
-
 fn format_turn_tokens(included: bool, value: u64) -> String {
     if included {
         format_tokens(value)
@@ -1056,6 +1266,32 @@ fn format_turn_cost(included: bool, cost: Option<f64>) -> String {
     } else {
         "n/a".to_string()
     }
+}
+
+fn handle_conversation_modal_input(
+    modal: &mut ConversationModalState,
+    key: KeyEvent,
+    total_rows: usize,
+) -> bool {
+    match key.code {
+        KeyCode::Esc => {
+            modal.close();
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            modal.scroll_up(total_rows);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            modal.scroll_down(total_rows);
+        }
+        KeyCode::PageUp => {
+            modal.page_up(total_rows);
+        }
+        KeyCode::PageDown => {
+            modal.page_down(total_rows);
+        }
+        _ => {}
+    }
+    true
 }
 
 fn handle_pricing_input(
@@ -1184,34 +1420,30 @@ fn handle_pricing_form_input(
             form.error = None;
             false
         }
-        KeyCode::Char(ch)
-            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
-        {
+        KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
             let value = form.active_value_mut();
             value.push(ch);
             form.error = None;
             false
         }
-        KeyCode::Enter => {
-            match form.parse() {
-                Ok(price) => {
-                    let result = if let Some(row_id) = id {
-                        runtime.block_on(storage.update_price(row_id, &price))
-                    } else {
-                        runtime.block_on(storage.insert_price(&price)).map(|_| ())
-                    };
-                    if let Err(err) = result {
-                        form.error = Some(err.to_string());
-                        return false;
-                    }
-                    true
+        KeyCode::Enter => match form.parse() {
+            Ok(price) => {
+                let result = if let Some(row_id) = id {
+                    runtime.block_on(storage.update_price(row_id, &price))
+                } else {
+                    runtime.block_on(storage.insert_price(&price)).map(|_| ())
+                };
+                if let Err(err) = result {
+                    form.error = Some(err.to_string());
+                    return false;
                 }
-                Err(message) => {
-                    form.error = Some(message);
-                    false
-                }
+                true
             }
-        }
+            Err(message) => {
+                form.error = Some(message);
+                false
+            }
+        },
         _ => false,
     }
 }
@@ -1384,10 +1616,12 @@ impl ConversationStats {
             .checked_sub_signed(ChronoDuration::days(6))
             .unwrap_or(today);
         let month_start = NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today);
+        let all_time_start = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap_or(today);
 
         let day_start = start_of_day(today);
         let week_start_dt = start_of_day(week_start);
         let month_start_dt = start_of_day(month_start);
+        let all_time_start_dt = start_of_day(all_time_start);
 
         let day = storage
             .top_conversations_between(day_start, now, limit, true)
@@ -1397,6 +1631,9 @@ impl ConversationStats {
             .await?;
         let month = storage
             .top_conversations_between(month_start_dt, now, limit, true)
+            .await?;
+        let all_time = storage
+            .top_conversations_between(all_time_start_dt, now, limit, true)
             .await?;
 
         Ok(Self {
@@ -1412,6 +1649,10 @@ impl ConversationStats {
                 ConversationPeriodStats {
                     label: "This Month",
                     aggregates: month,
+                },
+                ConversationPeriodStats {
+                    label: "All Time",
+                    aggregates: all_time,
                 },
             ],
         })
@@ -1439,23 +1680,178 @@ struct ConversationPeriodStats {
     aggregates: Vec<ConversationAggregate>,
 }
 
-struct ConversationViewState {
-    active_period: usize,
+struct ListState {
     selected_row: usize,
+    scroll_offset: usize,
+    visible_rows: usize,
 }
 
-impl ConversationViewState {
+impl ListState {
+    fn new() -> Self {
+        Self {
+            selected_row: 0,
+            scroll_offset: 0,
+            visible_rows: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.selected_row = 0;
+        self.scroll_offset = 0;
+    }
+
+    fn set_visible_rows(&mut self, visible_rows: usize, total_rows: usize) {
+        self.visible_rows = visible_rows;
+        self.clamp(total_rows);
+    }
+
+    fn clamp(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.reset();
+            return;
+        }
+        if self.selected_row >= total_rows {
+            self.selected_row = total_rows - 1;
+        }
+        if self.scroll_offset > self.selected_row {
+            self.scroll_offset = self.selected_row;
+        }
+        if self.visible_rows == 0 {
+            return;
+        }
+        let max_scroll = total_rows.saturating_sub(self.visible_rows);
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
+        }
+        if self.selected_row >= self.scroll_offset + self.visible_rows {
+            self.scroll_offset = self.selected_row + 1 - self.visible_rows;
+        }
+    }
+
+    fn move_selection_up(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.reset();
+            return;
+        }
+        if self.selected_row > 0 {
+            self.selected_row -= 1;
+        }
+        self.clamp(total_rows);
+    }
+
+    fn move_selection_down(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.reset();
+            return;
+        }
+        if self.selected_row + 1 < total_rows {
+            self.selected_row += 1;
+        }
+        self.clamp(total_rows);
+    }
+
+    fn page_up(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.reset();
+            return;
+        }
+        let step = self.visible_rows.max(1);
+        if self.selected_row >= step {
+            self.selected_row -= step;
+        } else {
+            self.selected_row = 0;
+        }
+        self.clamp(total_rows);
+    }
+
+    fn page_down(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.reset();
+            return;
+        }
+        let step = self.visible_rows.max(1);
+        self.selected_row = (self.selected_row + step).min(total_rows - 1);
+        self.clamp(total_rows);
+    }
+
+    fn page_info(&self, total_rows: usize) -> (usize, usize) {
+        if total_rows == 0 || self.visible_rows == 0 {
+            return (1, 1);
+        }
+        let pages = (total_rows + self.visible_rows - 1) / self.visible_rows;
+        let page = (self.scroll_offset / self.visible_rows) + 1;
+        (page, pages.max(1))
+    }
+}
+
+struct RecentConversationViewState {
+    list: ListState,
+    initialized: bool,
+}
+
+impl RecentConversationViewState {
+    fn new() -> Self {
+        Self {
+            list: ListState::new(),
+            initialized: false,
+        }
+    }
+
+    fn sync_with(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.list.reset();
+            self.initialized = false;
+            return;
+        }
+        if !self.initialized {
+            self.list.reset();
+            self.initialized = true;
+        } else {
+            self.list.clamp(total_rows);
+        }
+    }
+
+    fn move_selection_up(&mut self, total_rows: usize) {
+        self.list.move_selection_up(total_rows);
+    }
+
+    fn move_selection_down(&mut self, total_rows: usize) {
+        self.list.move_selection_down(total_rows);
+    }
+
+    fn page_up(&mut self, total_rows: usize) {
+        self.list.page_up(total_rows);
+    }
+
+    fn page_down(&mut self, total_rows: usize) {
+        self.list.page_down(total_rows);
+    }
+
+    fn selected<'a>(
+        &self,
+        conversations: &'a [ConversationAggregate],
+    ) -> Option<&'a ConversationAggregate> {
+        conversations.get(self.list.selected_row)
+    }
+}
+
+struct TopSpendingViewState {
+    active_period: usize,
+    list: ListState,
+}
+
+impl TopSpendingViewState {
     fn new() -> Self {
         Self {
             active_period: 0,
-            selected_row: 0,
+            list: ListState::new(),
         }
     }
 
     fn sync_with(&mut self, stats: &ConversationStats) {
         if stats.is_empty() {
             self.active_period = 0;
-            self.selected_row = 0;
+            self.list.reset();
             return;
         }
 
@@ -1464,11 +1860,7 @@ impl ConversationViewState {
         }
 
         let rows = stats.active_period_len(self.active_period);
-        if rows == 0 {
-            self.selected_row = 0;
-        } else if self.selected_row >= rows {
-            self.selected_row = rows - 1;
-        }
+        self.list.clamp(rows);
     }
 
     fn prev_period(&mut self, periods: usize) {
@@ -1480,7 +1872,7 @@ impl ConversationViewState {
         } else {
             self.active_period - 1
         };
-        self.selected_row = 0;
+        self.list.reset();
     }
 
     fn next_period(&mut self, periods: usize) {
@@ -1488,33 +1880,131 @@ impl ConversationViewState {
             return;
         }
         self.active_period = (self.active_period + 1) % periods;
-        self.selected_row = 0;
+        self.list.reset();
     }
 
     fn move_selection_up(&mut self, rows: usize) {
-        if rows == 0 {
-            self.selected_row = 0;
-            return;
-        }
-        if self.selected_row > 0 {
-            self.selected_row -= 1;
-        }
+        self.list.move_selection_up(rows);
     }
 
     fn move_selection_down(&mut self, rows: usize) {
-        if rows == 0 {
-            self.selected_row = 0;
-            return;
-        }
-        if self.selected_row + 1 < rows {
-            self.selected_row += 1;
-        }
+        self.list.move_selection_down(rows);
+    }
+
+    fn page_up(&mut self, rows: usize) {
+        self.list.page_up(rows);
+    }
+
+    fn page_down(&mut self, rows: usize) {
+        self.list.page_down(rows);
     }
 
     fn selected<'a>(&self, stats: &'a ConversationStats) -> Option<&'a ConversationAggregate> {
         stats
             .period(self.active_period)
-            .and_then(|period| period.aggregates.get(self.selected_row))
+            .and_then(|period| period.aggregates.get(self.list.selected_row))
+    }
+}
+
+struct ConversationModalState {
+    open: bool,
+    scroll_offset: usize,
+    visible_rows: usize,
+    active_key: Option<String>,
+}
+
+impl ConversationModalState {
+    fn new() -> Self {
+        Self {
+            open: false,
+            scroll_offset: 0,
+            visible_rows: 0,
+            active_key: None,
+        }
+    }
+
+    fn is_open(&self) -> bool {
+        self.open
+    }
+
+    fn open_for(&mut self, key: String) {
+        self.scroll_offset = 0;
+        self.active_key = Some(key);
+        self.open = true;
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.active_key = None;
+    }
+
+    fn set_visible_rows(&mut self, visible_rows: usize, total_rows: usize) {
+        self.visible_rows = visible_rows;
+        self.clamp(total_rows);
+    }
+
+    fn clamp(&mut self, total_rows: usize) {
+        if total_rows == 0 || self.visible_rows == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        let max_scroll = total_rows.saturating_sub(self.visible_rows);
+        if self.scroll_offset > max_scroll {
+            self.scroll_offset = max_scroll;
+        }
+    }
+
+    fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    fn scroll_up(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        if self.scroll_offset > 0 {
+            self.scroll_offset -= 1;
+        }
+    }
+
+    fn scroll_down(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        if self.visible_rows == 0 {
+            return;
+        }
+        let max_scroll = total_rows.saturating_sub(self.visible_rows);
+        if self.scroll_offset < max_scroll {
+            self.scroll_offset += 1;
+        }
+    }
+
+    fn page_up(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        if self.visible_rows == 0 {
+            return;
+        }
+        let step = self.visible_rows.max(1);
+        self.scroll_offset = self.scroll_offset.saturating_sub(step);
+    }
+
+    fn page_down(&mut self, total_rows: usize) {
+        if total_rows == 0 {
+            self.scroll_offset = 0;
+            return;
+        }
+        if self.visible_rows == 0 {
+            return;
+        }
+        let step = self.visible_rows.max(1);
+        let max_scroll = total_rows.saturating_sub(self.visible_rows);
+        self.scroll_offset = (self.scroll_offset + step).min(max_scroll);
     }
 }
 
@@ -1607,8 +2097,15 @@ impl PricingViewState {
 
 enum PricingModal {
     Create(PricingFormState),
-    Update { id: i64, form: PricingFormState },
-    DeleteConfirm { id: i64, label: String, error: Option<String> },
+    Update {
+        id: i64,
+        form: PricingFormState,
+    },
+    DeleteConfirm {
+        id: i64,
+        label: String,
+        error: Option<String>,
+    },
 }
 
 struct PricingFormState {
@@ -1760,6 +2257,13 @@ fn format_conversation_label(id: Option<&String>) -> String {
     truncate_text(label, 22)
 }
 
+fn conversation_key(aggregate: &ConversationAggregate) -> String {
+    aggregate
+        .conversation_id
+        .clone()
+        .unwrap_or_else(|| "__unlabeled__".to_string())
+}
+
 fn full_conversation_label(id: Option<&String>) -> String {
     let raw = id.map(|s| s.trim()).unwrap_or("");
     if raw.is_empty() {
@@ -1769,28 +2273,29 @@ fn full_conversation_label(id: Option<&String>) -> String {
     }
 }
 
-fn conversation_detail_rows(aggregate: &ConversationAggregate) -> Vec<Row<'static>> {
+fn conversation_detail_rows(
+    aggregate: &ConversationAggregate,
+    theme: &UiTheme,
+) -> Vec<Row<'static>> {
     vec![
-        detail_row(
-            "Conversation",
-            full_conversation_label(aggregate.conversation_id.as_ref()),
-        ),
         detail_row(
             "First Prompt",
             format_detail_snippet(aggregate.first_title.as_ref()),
+            theme,
         ),
         detail_row(
             "Last Result",
             format_detail_snippet(aggregate.last_summary.as_ref()),
+            theme,
         ),
     ]
 }
 
-fn detail_row(label: &'static str, value: String) -> Row<'static> {
+fn detail_row(label: &'static str, value: String, theme: &UiTheme) -> Row<'static> {
     Row::new(vec![
         Cell::from(label).style(
             Style::default()
-                .fg(Color::Gray)
+                .fg(theme.label_fg)
                 .add_modifier(Modifier::BOLD),
         ),
         Cell::from(value),
@@ -1803,7 +2308,7 @@ fn format_detail_snippet(text: Option<&String>) -> String {
         if trimmed.is_empty() {
             None
         } else {
-            Some(truncate_text(trimmed, DETAIL_SNIPPET_LIMIT))
+            Some(trimmed.to_string())
         }
     })
     .unwrap_or_else(|| "—".to_string())
@@ -1821,17 +2326,17 @@ fn truncate_text(input: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn light_blue_header(labels: Vec<&'static str>) -> Row<'static> {
+fn light_blue_header(labels: Vec<&'static str>, theme: &UiTheme) -> Row<'static> {
     Row::new(labels).style(
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme.header_fg)
             .add_modifier(Modifier::BOLD),
     )
 }
 
-fn gray_block(title: impl Into<String>) -> Block<'static> {
+fn gray_block(title: impl Into<String>, theme: &UiTheme) -> Block<'static> {
     Block::default()
         .title(title.into())
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(theme.border_fg))
 }
