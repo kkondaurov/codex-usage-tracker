@@ -6,6 +6,7 @@ use crate::{
     },
 };
 use anyhow::Result;
+use base64::{engine::general_purpose, Engine as _};
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, Months, NaiveDate, TimeZone, Timelike, Utc,
 };
@@ -24,7 +25,7 @@ use ratatui::{
 };
 use std::{
     collections::HashMap,
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     path::Path,
     sync::Arc,
     sync::mpsc,
@@ -334,6 +335,8 @@ fn run_blocking(
                         cache.recent_offset,
                         &cache.session_stats,
                         cache.modal_turns.len(),
+                        &cache.modal_model_mix,
+                        &cache.modal_tool_counts,
                         &cache.pricing_rows,
                         &runtime,
                         &storage,
@@ -358,6 +361,8 @@ fn run_blocking(
                         cache.recent_offset,
                         &cache.session_stats,
                         cache.modal_turns.len(),
+                        &cache.modal_model_mix,
+                        &cache.modal_tool_counts,
                         &cache.pricing_rows,
                         &runtime,
                         &storage,
@@ -1534,9 +1539,18 @@ fn render_session_turns_table(
     theme: &UiTheme,
 ) {
     let note_max = {
-        let spacing = 10u16;
-        let fixed_total =
-            19u16 + 18u16 + 10u16 + 7u16 + 7u16 + 7u16 + 7u16 + 7u16 + 9u16 + 5u16;
+        let spacing = 11u16;
+        let fixed_total = 19u16
+            + 18u16
+            + 10u16
+            + 7u16
+            + 7u16
+            + 7u16
+            + 7u16
+            + 7u16
+            + 9u16
+            + 6u16
+            + 5u16;
         let total = area.width.saturating_sub(spacing);
         let available = total.saturating_sub(fixed_total) as usize;
         available.max(24)
@@ -1546,6 +1560,7 @@ fn render_session_turns_table(
         vec![
             "Time",
             "Model",
+            "Eff",
             "Note",
             "Cost",
             "Input",
@@ -1563,7 +1578,7 @@ fn render_session_turns_table(
     let (page, pages) = page_info_for_scroll(scroll_offset, visible_rows, turns.len());
     let rows: Vec<Row> = if turns.is_empty() {
         vec![Row::new(vec![
-            "–", "No turns", "", "", "", "", "", "", "", "", "",
+            "–", "No turns", "", "", "", "", "", "", "", "", "", "",
         ])]
     } else {
         let start = scroll_offset.min(turns.len());
@@ -1579,6 +1594,7 @@ fn render_session_turns_table(
                 Row::new(vec![
                     turn.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
                     truncate_text(&turn.model, MODEL_NAME_MAX_CHARS),
+                    format_turn_effort(turn.reasoning_effort.as_deref()),
                     result,
                     format_turn_cost(turn.usage_included, turn.cost_usd),
                     format_turn_tokens(turn.usage_included, turn.prompt_tokens),
@@ -1596,6 +1612,7 @@ fn render_session_turns_table(
     let widths = [
         Constraint::Length(19),
         Constraint::Length(18),
+        Constraint::Length(6),
         Constraint::Min(24),
         Constraint::Length(10),
         Constraint::Length(7),
@@ -1668,6 +1685,27 @@ fn format_ctx_percent(total_tokens: u64, context_window: Option<u64>) -> String 
     format!("{:.0}%", pct)
 }
 
+fn format_effort_short(effort: &str) -> String {
+    let trimmed = effort.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "low" => "low".to_string(),
+        "medium" => "med".to_string(),
+        "high" => "high".to_string(),
+        _ => truncate_text(trimmed, 6),
+    }
+}
+
+fn format_turn_effort(effort: Option<&str>) -> String {
+    effort
+        .map(format_effort_short)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "—".to_string())
+}
+
 fn handle_key_event(
     key: KeyEvent,
     view_mode: &mut ViewMode,
@@ -1681,6 +1719,8 @@ fn handle_key_event(
     recent_offset: usize,
     session_stats: &SessionStats,
     session_turns_len: usize,
+    modal_model_mix: &[ModelUsageRow],
+    modal_tool_counts: &[ToolCountRow],
     pricing_rows: &[PriceRow],
     runtime: &Handle,
     storage: &Storage,
@@ -1693,10 +1733,22 @@ fn handle_key_event(
         return true;
     }
 
-    if session_modal.is_open()
-        && handle_session_modal_input(session_modal, key, session_turns_len)
-    {
-        return false;
+    if session_modal.is_open() {
+        let selected_session = match *view_mode {
+            ViewMode::Overview => overview_view.selected(recent_sessions, recent_offset),
+            ViewMode::TopSpending => top_spending_view.selected(session_stats),
+            _ => None,
+        };
+        if handle_session_modal_input(
+            session_modal,
+            key,
+            session_turns_len,
+            selected_session,
+            modal_model_mix,
+            modal_tool_counts,
+        ) {
+            return false;
+        }
     }
 
     if handle_pricing_input(
@@ -1808,6 +1860,9 @@ fn handle_session_modal_input(
     modal: &mut SessionModalState,
     key: KeyEvent,
     total_rows: usize,
+    selected: Option<&SessionAggregate>,
+    model_mix: &[ModelUsageRow],
+    tool_counts: &[ToolCountRow],
 ) -> bool {
     match key.code {
         KeyCode::Esc => {
@@ -1824,6 +1879,15 @@ fn handle_session_modal_input(
         }
         KeyCode::PageDown => {
             modal.page_down(total_rows);
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y')
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            if let Some(aggregate) = selected {
+                if let Err(err) = copy_session_details_osc52(aggregate, model_mix, tool_counts) {
+                    tracing::warn!(error = %err, "failed to copy session details");
+                }
+            }
         }
         _ => {}
     }
@@ -2960,15 +3024,7 @@ fn session_detail_rows(
     model_mix: &[ModelUsageRow],
     tool_counts: &[ToolCountRow],
 ) -> Vec<Row<'static>> {
-    let token_summary = format!(
-        "in {} | out {} | cached {} | blended {} | api {} | reasoning {}",
-        format_tokens(aggregate.prompt_tokens),
-        format_tokens(aggregate.completion_tokens),
-        format_tokens(aggregate.cached_prompt_tokens),
-        format_tokens(aggregate.blended_total()),
-        format_tokens(aggregate.total_tokens),
-        format_tokens(aggregate.reasoning_tokens),
-    );
+    let token_summary = session_token_summary(aggregate);
 
     vec![
         detail_row(
@@ -2998,6 +3054,47 @@ fn session_detail_rows(
             theme,
         ),
     ]
+}
+
+fn session_token_summary(aggregate: &SessionAggregate) -> String {
+    format!(
+        "in {} | out {} | cached {} | blended {} | api {} | reasoning {}",
+        format_tokens(aggregate.prompt_tokens),
+        format_tokens(aggregate.completion_tokens),
+        format_tokens(aggregate.cached_prompt_tokens),
+        format_tokens(aggregate.blended_total()),
+        format_tokens(aggregate.total_tokens),
+        format_tokens(aggregate.reasoning_tokens),
+    )
+}
+
+fn build_session_share_text(
+    aggregate: &SessionAggregate,
+    model_mix: &[ModelUsageRow],
+    tool_counts: &[ToolCountRow],
+) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!(
+        "Session {}",
+        full_session_label(aggregate.session_id.as_str())
+    ));
+    lines.push(format!("Cost {}", format_cost(aggregate.cost_usd)));
+    lines.push(format!("Tokens {}", session_token_summary(aggregate)));
+    lines.push(format!("Models {}", format_model_mix(model_mix)));
+    lines.push(format!("Tools {}", format_tool_counts(tool_counts)));
+    lines.join("\n")
+}
+
+fn copy_session_details_osc52(
+    aggregate: &SessionAggregate,
+    model_mix: &[ModelUsageRow],
+    tool_counts: &[ToolCountRow],
+) -> io::Result<()> {
+    let text = build_session_share_text(aggregate, model_mix, tool_counts);
+    let encoded = general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b]52;c;{}\x07", encoded)?;
+    stdout.flush()
 }
 
 fn detail_row(label: &'static str, value: String, theme: &UiTheme) -> Row<'static> {
@@ -3040,11 +3137,11 @@ fn format_model_mix(models: &[ModelUsageRow]) -> String {
             break;
         }
         let pct = (row.total_tokens as f64 / total as f64) * 100.0;
-        parts.push(format!(
-            "{} {}%",
-            truncate_text(&row.model, MODEL_NAME_MAX_CHARS),
-            pct.round() as u64
-        ));
+        let label = match row.reasoning_effort.as_deref() {
+            Some(effort) => format!("{} {}", row.model, effort),
+            None => row.model.clone(),
+        };
+        parts.push(format!("{label} {}%", pct.round() as u64));
     }
     if remaining > 0 {
         parts.push(format!("+{remaining} more"));
@@ -3139,6 +3236,7 @@ mod tests {
                 "sess-1",
                 now,
                 "gpt-test",
+                None,
                 None,
                 None,
                 100,

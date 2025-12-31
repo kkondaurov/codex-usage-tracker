@@ -17,7 +17,7 @@ async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     let config = config::AppConfig::load(cli.config_path.as_deref())?;
     let app = app::App::new(config).await?;
-    app.run().await
+    app.run(cli.rebuild).await
 }
 
 fn init_tracing() {

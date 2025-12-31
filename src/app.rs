@@ -20,9 +20,13 @@ impl App {
         })
     }
 
-    pub async fn run(self) -> Result<()> {
+    pub async fn run(self, rebuild: bool) -> Result<()> {
         let storage = Storage::connect(&self.config.storage.database_path).await?;
         storage.ensure_schema().await?;
+        if rebuild {
+            tracing::info!("Rebuild requested: truncating usage tables");
+            storage.truncate_usage_tables().await?;
+        }
 
         let today = Utc::now().date_naive();
         let prices: Vec<NewPrice> = self

@@ -64,3 +64,8 @@ cargo run --release
 Run `codex` normally. The tracker will pick up session logs from `~/.codex/sessions` as they are written.
 
 Pricing is seeded from `codex-usage.toml` on first run (effective_from = today). Use the Pricing tab (`4`) in the TUI to add/update prices and backfill historical effective dates.
+
+To rebuild usage data from logs (clear non-pricing tables first):
+```
+cargo run --release -- --rebuild
+```

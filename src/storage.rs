@@ -162,6 +162,41 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn truncate_usage_tables(&self) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM session_tool_calls;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear session_tool_calls")?;
+        sqlx::query("DELETE FROM session_turns;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear session_turns")?;
+        sqlx::query("DELETE FROM session_daily_stats;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear session_daily_stats")?;
+        sqlx::query("DELETE FROM daily_stats;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear daily_stats")?;
+        sqlx::query("DELETE FROM sessions;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear sessions")?;
+        sqlx::query("DELETE FROM ingest_state;")
+            .execute(&mut *tx)
+            .await
+            .with_context(|| "failed to clear ingest_state")?;
+        let _ = sqlx::query(
+            "DELETE FROM sqlite_sequence WHERE name IN ('session_turns','session_tool_calls');",
+        )
+        .execute(&mut *tx)
+        .await;
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn ensure_core_schema(&self) -> Result<()> {
         sqlx::query("DROP VIEW IF EXISTS event_costs;")
             .execute(&*self.pool)
@@ -266,6 +301,7 @@ impl Storage {
                 model TEXT NOT NULL,
                 note TEXT,
                 context_window INTEGER,
+                reasoning_effort TEXT,
                 prompt_tokens INTEGER NOT NULL,
                 cached_prompt_tokens INTEGER NOT NULL,
                 completion_tokens INTEGER NOT NULL,
@@ -285,6 +321,15 @@ impl Storage {
                 .execute(&*self.pool)
                 .await
                 .with_context(|| "failed to add session_turns.context_window column")?;
+        }
+        let has_reasoning_effort = self
+            .table_has_column("session_turns", "reasoning_effort")
+            .await?;
+        if !has_reasoning_effort {
+            sqlx::query("ALTER TABLE session_turns ADD COLUMN reasoning_effort TEXT;")
+                .execute(&*self.pool)
+                .await
+                .with_context(|| "failed to add session_turns.reasoning_effort column")?;
         }
 
         sqlx::query(
@@ -340,13 +385,22 @@ impl Storage {
                 last_committed_output_tokens INTEGER NOT NULL DEFAULT 0,
                 last_committed_reasoning_output_tokens INTEGER NOT NULL DEFAULT 0,
                 last_committed_total_tokens INTEGER NOT NULL DEFAULT 0,
-                current_model TEXT
+                current_model TEXT,
+                current_effort TEXT
             );
             "#,
         )
         .execute(&*self.pool)
         .await
         .with_context(|| "failed to ensure ingest_state schema")?;
+
+        let has_current_effort = self.table_has_column("ingest_state", "current_effort").await?;
+        if !has_current_effort {
+            sqlx::query("ALTER TABLE ingest_state ADD COLUMN current_effort TEXT;")
+                .execute(&*self.pool)
+                .await
+                .with_context(|| "failed to add ingest_state.current_effort column")?;
+        }
 
         sqlx::query(
             r#"
@@ -705,11 +759,11 @@ impl Storage {
     pub async fn session_model_mix(&self, session_id: &str) -> Result<Vec<ModelUsageRow>> {
         let rows = sqlx::query(
             r#"
-            SELECT model, SUM(total_tokens) AS total_tokens
-            FROM session_daily_stats
+            SELECT model, reasoning_effort, SUM(total_tokens) AS total_tokens
+            FROM session_turns
             WHERE session_id = ?
-            GROUP BY model
-            ORDER BY total_tokens DESC, model ASC
+            GROUP BY model, reasoning_effort
+            ORDER BY total_tokens DESC, model ASC, reasoning_effort ASC
             "#,
         )
         .bind(session_id)
@@ -721,6 +775,7 @@ impl Storage {
         for row in rows {
             result.push(ModelUsageRow {
                 model: row.try_get::<String, _>("model")?,
+                reasoning_effort: row.try_get::<Option<String>, _>("reasoning_effort")?,
                 total_tokens: row.try_get::<i64, _>("total_tokens").unwrap_or(0) as u64,
             });
         }
@@ -1112,8 +1167,9 @@ impl Storage {
     pub async fn session_turns(&self, session_id: &str, limit: usize) -> Result<Vec<SessionTurn>> {
         let rows = sqlx::query(
             r#"
-            SELECT timestamp, model, note, context_window, prompt_tokens, cached_prompt_tokens,
-                   completion_tokens, total_tokens, reasoning_tokens,
+            SELECT timestamp, model, note, context_window, reasoning_effort,
+                   prompt_tokens, cached_prompt_tokens, completion_tokens,
+                   total_tokens, reasoning_tokens,
                    cost_usd, missing_price
             FROM session_turn_costs
             WHERE session_id = ?
@@ -1144,6 +1200,7 @@ impl Storage {
                     .ok()
                     .flatten()
                     .and_then(|value| u64::try_from(value).ok()),
+                reasoning_effort: row.try_get::<Option<String>, _>("reasoning_effort")?,
                 prompt_tokens: row.try_get::<i64, _>("prompt_tokens").unwrap_or(0) as u64,
                 cached_prompt_tokens: row
                     .try_get::<i64, _>("cached_prompt_tokens")
@@ -1263,6 +1320,7 @@ impl Storage {
         model: &str,
         note: Option<&str>,
         context_window: Option<u64>,
+        reasoning_effort: Option<&str>,
         prompt_tokens: u64,
         cached_prompt_tokens: u64,
         completion_tokens: u64,
@@ -1295,9 +1353,9 @@ impl Storage {
         sqlx::query(
             r#"
             INSERT INTO session_turns (
-                session_id, timestamp, model, note, context_window, prompt_tokens,
+                session_id, timestamp, model, note, context_window, reasoning_effort, prompt_tokens,
                 cached_prompt_tokens, completion_tokens, reasoning_tokens, total_tokens
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(session_id)
@@ -1305,6 +1363,7 @@ impl Storage {
         .bind(model)
         .bind(note)
         .bind(context_window.and_then(|value| i64::try_from(value).ok()))
+        .bind(reasoning_effort)
         .bind(i64::try_from(prompt_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(cached_prompt_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(completion_tokens).unwrap_or(i64::MAX))
@@ -1408,7 +1467,7 @@ impl Storage {
                    last_seen_total_tokens, last_committed_input_tokens,
                    last_committed_cached_input_tokens, last_committed_output_tokens,
                    last_committed_reasoning_output_tokens, last_committed_total_tokens,
-                   current_model
+                   current_model, current_effort
             FROM ingest_state
             "#,
         )
@@ -1453,6 +1512,7 @@ impl Storage {
                     .try_get::<i64, _>("last_committed_total_tokens")
                     .unwrap_or(0) as u64,
                 current_model: row.try_get::<Option<String>, _>("current_model")?,
+                current_effort: row.try_get::<Option<String>, _>("current_effort")?,
             });
         }
 
@@ -1469,8 +1529,8 @@ impl Storage {
                 last_seen_total_tokens, last_committed_input_tokens,
                 last_committed_cached_input_tokens, last_committed_output_tokens,
                 last_committed_reasoning_output_tokens, last_committed_total_tokens,
-                current_model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                current_model, current_effort
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(path) DO UPDATE SET
                 session_id = excluded.session_id,
                 last_offset = excluded.last_offset,
@@ -1484,7 +1544,8 @@ impl Storage {
                 last_committed_output_tokens = excluded.last_committed_output_tokens,
                 last_committed_reasoning_output_tokens = excluded.last_committed_reasoning_output_tokens,
                 last_committed_total_tokens = excluded.last_committed_total_tokens,
-                current_model = excluded.current_model
+                current_model = excluded.current_model,
+                current_effort = excluded.current_effort
             "#,
         )
         .bind(state.path.to_string_lossy().as_ref())
@@ -1501,6 +1562,7 @@ impl Storage {
         .bind(i64::try_from(state.last_committed_reasoning_output_tokens).unwrap_or(i64::MAX))
         .bind(i64::try_from(state.last_committed_total_tokens).unwrap_or(i64::MAX))
         .bind(state.current_model.as_deref())
+        .bind(state.current_effort.as_deref())
         .execute(&*self.pool)
         .await
         .with_context(|| "failed to upsert ingest state")?;
@@ -1600,6 +1662,7 @@ pub struct SessionTurn {
     pub model: String,
     pub note: Option<String>,
     pub context_window: Option<u64>,
+    pub reasoning_effort: Option<String>,
     pub prompt_tokens: u64,
     pub cached_prompt_tokens: u64,
     pub completion_tokens: u64,
@@ -1612,6 +1675,7 @@ pub struct SessionTurn {
 #[derive(Debug, Clone)]
 pub struct ModelUsageRow {
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub total_tokens: u64,
 }
 
@@ -1695,6 +1759,7 @@ pub struct IngestStateRow {
     pub last_committed_reasoning_output_tokens: u64,
     pub last_committed_total_tokens: u64,
     pub current_model: Option<String>,
+    pub current_effort: Option<String>,
 }
 
 fn cost_from_row(row: &SqliteRow) -> Option<f64> {
@@ -1766,6 +1831,7 @@ mod tests {
                 "gpt-test",
                 None,
                 None,
+                None,
                 1_000_000,
                 200_000,
                 300_000,
@@ -1798,6 +1864,7 @@ mod tests {
                 "gpt-test",
                 None,
                 None,
+                None,
                 100_000,
                 0,
                 50_000,
@@ -1811,6 +1878,7 @@ mod tests {
                 "sess-b",
                 base - ChronoDuration::minutes(5),
                 "gpt-test",
+                None,
                 None,
                 None,
                 300_000,

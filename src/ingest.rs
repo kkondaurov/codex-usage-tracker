@@ -85,6 +85,7 @@ struct FileState {
     last_seen: TokenTotals,
     last_committed: TokenTotals,
     current_model: Option<String>,
+    current_effort: Option<String>,
     pending_note: Option<String>,
     pending_note_seq: u64,
     used_note_seq: u64,
@@ -100,6 +101,7 @@ impl FileState {
             last_seen: TokenTotals::default(),
             last_committed: TokenTotals::default(),
             current_model: None,
+            current_effort: None,
             pending_note: None,
             pending_note_seq: 0,
             used_note_seq: 0,
@@ -127,6 +129,7 @@ impl FileState {
                 total_tokens: state.last_committed_total_tokens,
             },
             current_model: state.current_model.clone(),
+            current_effort: state.current_effort.clone(),
             pending_note: None,
             pending_note_seq: 0,
             used_note_seq: 0,
@@ -151,6 +154,7 @@ impl FileState {
             last_committed_reasoning_output_tokens: self.last_committed.reasoning_output_tokens,
             last_committed_total_tokens: self.last_committed.total_tokens,
             current_model: self.current_model.clone(),
+            current_effort: self.current_effort.clone(),
         }
     }
 }
@@ -316,12 +320,16 @@ async fn process_event(storage: &Storage, state: &mut FileState, value: &Value) 
             }
         }
         "turn_context" => {
-            if let Some(model) = value
-                .get("payload")
-                .and_then(|p| p.get("model"))
-                .and_then(|m| m.as_str())
-            {
-                state.current_model = Some(model.to_string());
+            if let Some(payload) = value.get("payload") {
+                if let Some(model) = payload.get("model").and_then(|m| m.as_str()) {
+                    state.current_model = Some(model.to_string());
+                }
+                state.current_effort = payload
+                    .get("effort")
+                    .and_then(|v| v.as_str())
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.to_string());
             }
         }
         "event_msg" => {
@@ -511,6 +519,7 @@ async fn handle_token_count(
             model,
             note,
             context_window,
+            state.current_effort.as_deref(),
             delta.input_tokens,
             delta.cached_input_tokens,
             delta.output_tokens,

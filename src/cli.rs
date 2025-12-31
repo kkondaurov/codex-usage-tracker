@@ -8,4 +8,7 @@ pub struct Cli {
     /// Path to a TOML configuration file (defaults to ./codex-usage.toml if present).
     #[arg(long, value_name = "FILE")]
     pub config_path: Option<PathBuf>,
+    /// Rebuild usage data by truncating all non-pricing tables before ingesting.
+    #[arg(long)]
+    pub rebuild: bool,
 }
