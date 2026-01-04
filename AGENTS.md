@@ -32,8 +32,7 @@ This repository hosts a Rust-based local TUI that tracks OpenAI / Codex usage. T
 ## Commit & Pull Request Guidelines
 
 - Use clear, imperative commit messages: `Add daily aggregate storage`, `Fix TUI refresh bug`.
-- Reference `bd` issue IDs in commits or PR descriptions when possible (e.g. `codex-usage-tracker-0j1`).
-- PRs should describe the change, mention user-visible behavior, and note any new config or migrations.
+- Commit messages should describe the change, mention user-visible behavior, and note any new config or migrations.
 - Escalate the permissions to do the commit, never attempt to do create or delete git lock file.
 - Only commit if and when explicitly instructed by the user.
 
